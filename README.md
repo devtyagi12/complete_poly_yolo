@@ -1,109 +1,122 @@
 # YOLOv8-Extended — Polygon & Distance Detection
 
-An extension of [YOLOv8s](https://docs.ultralytics.com/) that adds two new output modalities **alongside** the standard bounding-box and class outputs:
+A PyTorch extension of YOLOv8 that adds **instance polygon segmentation** and **metric distance regression** to the standard bounding-box + classification outputs — all in a single forward pass with no external dependencies beyond PyTorch and OpenCV.
 
-| Output | Description |
-|--------|-------------|
-| **Bounding box** | Standard YOLO box (cx, cy, w, h) decoded via DFL |
-| **Class** | Standard softmax classification |
-| **Polygon** | Star-shaped polygon representation — per-object shape mask |
-| **Distance** | Scalar metric depth per anchor point (metres, log-encoded) |
-
-All four outputs share a single forward pass. The box and class heads are **unchanged** from standard YOLOv8; the polygon and distance heads are additions that can be trained independently or jointly.
+```
+Input image
+    │
+    ▼
+YOLOv8 Backbone + PAN-FPN Neck
+    │
+    ├─── Bounding box  (standard DFL + CIoU, unchanged)
+    ├─── Class         (standard BCE, unchanged)
+    ├─── Polygon       (star-shaped descriptor, 3 sub-heads per FPN scale)
+    └─── Distance      (scalar metric depth in metres, per anchor)
+```
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#1-architecture-overview)
-2. [Star Polygon Representation](#2-star-polygon-representation)
-3. [Dataset Format](#3-dataset-format)
-4. [Project Structure](#4-project-structure)
-5. [Installation](#5-installation)
-6. [Configuration](#6-configuration)
-7. [Training](#7-training)
-8. [Validation & Testing](#8-validation--testing)
-9. [Inference](#9-inference)
-10. [Logging & Visualisation](#10-logging--visualisation)
-11. [Loss Functions](#11-loss-functions)
-12. [Post-Processing](#12-post-processing)
-13. [Extending the Codebase](#13-extending-the-codebase)
-14. [Troubleshooting](#14-troubleshooting)
+1. [What's New vs Standard YOLOv8](#1-whats-new-vs-standard-yolov8)
+2. [Architecture](#2-architecture)
+3. [Star Polygon Representation](#3-star-polygon-representation)
+4. [Dataset Format](#4-dataset-format)
+5. [Project Structure](#5-project-structure)
+6. [Installation](#6-installation)
+7. [Configuration System](#7-configuration-system)
+8. [Training](#8-training)
+9. [Validation & Testing](#9-validation--testing)
+10. [Inference](#10-inference)
+11. [Dataloader Visualiser](#11-dataloader-visualiser)
+12. [Training Visualisations](#12-training-visualisations)
+13. [Logging](#13-logging)
+14. [Loss Functions](#14-loss-functions)
+15. [Post-Processing](#15-post-processing)
+16. [GPU Compatibility](#16-gpu-compatibility)
+17. [Extending the Codebase](#17-extending-the-codebase)
+18. [Troubleshooting](#18-troubleshooting)
 
 ---
 
-## 1. Architecture Overview
+## 1. What's New vs Standard YOLOv8
 
-```
-Input Image (B, 3, 640, 640)
-        │
-        ▼
-┌─────────────────┐
-│  YOLOv8Backbone │  C2f blocks + SPPF, produces P3/P4/P5
-└────────┬────────┘
-         │  [P3, P4, P5]
-         ▼
-┌─────────────────┐
-│  YOLOv8Neck     │  PAN-FPN, top-down + bottom-up
-└────────┬────────┘
-         │  [N3, N4, N5]  (strides 8, 16, 32)
-         ▼
-  For each FPN scale:
-  ┌──────────────────────────────────────────────────────┐
-  │  DetHead                                             │
-  │    box_pre: ConvBN(3x3) → ConvBN(3x3)  ← penultimate│──┐
-  │    box_out: Conv1x1 → (4 × REG_MAX) channels        │  │
-  │    cls_pre: ConvBN(3x3) → ConvBN(3x3)               │  │
-  │    cls_out: Conv1x1 → num_classes channels           │  │
-  └──────────────────────────────────────────────────────┘  │ penultimate feat
-                                                             ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  PolyHead  (3 independent Conv1x1, from penultimate box feat)│
-  │    poly_conf  → (B, num_angles, H, W)  raw logits           │
-  │    poly_angle → (B, num_angles, H, W)  raw logits           │
-  │    poly_dist  → (B, num_angles, H, W)  pre-softplus         │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────┐
-  │  DistHead  (from neck feature, same as det head)     │
-  │    num_dist_blocks × ConvBN(3x3)                     │
-  │    Conv1x1 → (B, 1, H, W)  scalar distance          │
-  └──────────────────────────────────────────────────────┘
-```
-
-### Scale variants
-
-| Variant | Depth mult | Width mult | Approx params |
-|---------|-----------|-----------|---------------|
-| `n` | 0.33 | 0.25 | ~3 M |
-| `s` | 0.33 | 0.50 | ~11 M |
-| `m` | 0.67 | 0.75 | ~26 M |
-| `l` | 1.00 | 1.00 | ~44 M |
-| `x` | 1.33 | 1.25 | ~69 M |
-
-Set with `--model_size s` (default) or in `configs/default.yaml`.
+| Feature | Standard YOLOv8 | YOLOv8-Extended |
+|---------|----------------|-----------------|
+| Bounding box | ✅ DFL + CIoU | ✅ Unchanged |
+| Classification | ✅ BCE | ✅ Unchanged |
+| Instance polygon | ❌ | ✅ Star-shaped descriptor |
+| Metric distance | ❌ | ✅ Log-encoded regression |
+| Multiple datasets | ❌ | ✅ Weighted sampling |
+| Distance dataset | N/A | ✅ Optional, independent |
+| Pretrained init | ✅ | ✅ Backbone + neck transferred |
+| GroupNorm (AMD) | ❌ | ✅ `--gpu_type amd` |
+| Auto experiment dirs | ❌ | ✅ `exp1/`, `exp2/`, ... |
 
 ---
 
-## 2. Star Polygon Representation
+## 2. Architecture
 
-Instead of storing a variable-length list of vertices, each polygon is encoded as a fixed-size **star-shaped** descriptor centred on the bounding box centre.
+### Backbone and Neck
 
-### Encoding
+Standard YOLOv8 CSP backbone with SPPF and PAN-FPN neck, producing three FPN scales at strides 8, 16, and 32.
+
+| Variant | Depth | Width | ~Parameters |
+|---------|-------|-------|-------------|
+| `n` | 0.33 | 0.25 | 3 M |
+| `s` | 0.33 | 0.50 | 11 M |
+| `m` | 0.67 | 0.75 | 26 M |
+| `l` | 1.00 | 1.00 | 44 M |
+| `x` | 1.33 | 1.25 | 69 M |
+
+### Detection Head (unchanged)
+
+Decoupled box branch (`2 × ConvBN(3×3) → Conv1×1 → 4 × REG_MAX channels`) and class branch (`2 × ConvBN(3×3) → Conv1×1 → num_classes channels`), applied independently at each FPN scale.
+
+### Polygon Head (new — per FPN scale)
+
+Three independent `Conv1×1` heads reading from the **penultimate box branch feature map**:
 
 ```
-num_angles = 360 // angle_step          # default: 24 bins (angle_step=15°)
-
-For each polygon vertex:
-  1. Compute angle and distance from bbox centre
-  2. Map to angle bin:  bin_idx = floor(angle_deg / angle_step)
-  3. Keep only the farthest vertex per bin (max distance wins)
-
-Bins with no vertex → conf = 0, xy = (0, 0)
-Bins with a vertex  → conf = 1, xy = vertex coordinates
+penultimate box feature map
+    ├── poly_conf  → Conv1×1 → (B, num_angles, H, W)   raw logits
+    ├── poly_angle → Conv1×1 → (B, num_angles, H, W)   raw logits
+    └── poly_dist  → Conv1×1 → (B, num_angles, H, W)   pre-softplus
 ```
 
-### Wire format
+### Distance Head (new — per FPN scale)
+
+`num_dist_blocks × ConvBN(3×3)` followed by `Conv1×1 → (B, 1, H, W)`, reading from the same neck feature as the detection head.
+
+### Normalisation
+
+| `--gpu_type` | Normalisation layer |
+|---|---|
+| `nvidia` (default) | `BatchNorm2d` |
+| `amd` | `GroupNorm(32)` — avoids MIOpen JIT failures on ROCm |
+
+---
+
+## 3. Star Polygon Representation
+
+Each object's polygon is encoded as a fixed-size **star-shaped descriptor** centred on the bounding box centre, eliminating variable-length vertex lists.
+
+### Encoding algorithm
+
+```
+num_angles = 360 // angle_step          # default: 24 bins at 15 degrees each
+
+for each polygon vertex (x, y):
+    dx, dy   = vertex − bbox_centre
+    angle    = atan2(dy, dx) mod 360
+    bin_idx  = floor(angle / angle_step)
+    keep the vertex with maximum distance from centre per bin
+
+bins with no vertex → (x=0, y=0, conf=0)
+bins with a vertex  → (x, y, conf=1)
+```
+
+### Wire format (per object)
 
 ```
 [origin_x, origin_y,
@@ -112,39 +125,48 @@ Bins with a vertex  → conf = 1, xy = vertex coordinates
  ...
  x_{N-1}, y_{N-1}, conf_{N-1}]
 
-Total length = 2 + num_angles * 3
+total length = 2 + num_angles × 3
 ```
 
-All coordinates are **normalised** (0–1) in the dataset/target tensors.
+All coordinates are **normalised to [0, 1]** in label files and target tensors. After letterbox resizing they are remapped to canvas-normalised space.
 
 ### Augmentation in polar form
 
-Horizontal flip remaps bins analytically without recomputing from raw vertices:
+Horizontal flip remaps angle bins analytically rather than recomputing from raw vertices:
 
-```
-new_angle = (180 - angle_deg) % 360
-new_bin   = new_angle // angle_step
+```python
+new_bin = int((180 - bin_angle_deg) % 360 / angle_step)
 ```
 
-Mosaic assembly translates origin and vertices in normalised space proportionally, then rescales back to [0, 1].
+Mosaic translates origin and vertices proportionally in normalised space.
+
+### Changing bin resolution
+
+```yaml
+# configs/my_exp.yaml
+model:
+  angle_step: 10    # 36 bins instead of 24 — finer polygon detail
+```
+
+All downstream code adapts automatically. The label cache filename encodes the `angle_step` so changing it generates a fresh cache.
 
 ---
 
-## 3. Dataset Format
+## 4. Dataset Format
 
 ### Directory layout
 
 ```
 data/
-├── polygon/                     # polygon-only dataset (V8ParserExtended)
+├── polygon/                        # polygon-only dataset
 │   ├── images/
-│   │   ├── train/
+│   │   ├── train/   *.jpg / *.png
 │   │   └── val/
 │   └── labels/
-│       ├── train/
+│       ├── train/   *.txt
 │       └── val/
 │
-└── polygon_distance/            # polygon + distance (V8DistanceParser)
+└── polygon_distance/               # polygon + distance dataset (optional)
     ├── images/
     │   ├── train/
     │   └── val/
@@ -153,99 +175,99 @@ data/
         └── val/
 ```
 
+Image files and label files must share the same stem: `0001.jpg` ↔ `0001.txt`.
+
 ### Label file format
 
-Each `.txt` file contains one object per line. Images and label files share the same stem name (`0001.jpg` ↔ `0001.txt`).
+One object per line. Values are **normalised floats** in `[0, 1]`.
 
-**Polygon-only** (paired with `poly_dataset_root`):
+**Polygon-only:**
 ```
 <class_id> <x1> <y1> <x2> <y2> ... <xN> <yN>
 ```
 
-**Polygon + distance** (paired with `dist_dataset_root`):
+**Polygon + distance:**
 ```
 <class_id> <x1> <y1> <x2> <y2> ... <xN> <yN> <distance_metres>
 ```
 
-- All `xi`, `yi` values are **normalised** floats in [0, 1] (YOLO convention).
-- `N` is the number of polygon vertices (can vary per object and per file).
-- `distance_metres` must be > 0 for a valid distance reading; non-positive values are treated as missing.
-- Multiple objects on separate lines; blank lines are skipped.
-
-### Example label file (polygon-only)
-
-```
-0 0.512 0.310 0.601 0.298 0.635 0.401 0.590 0.455 0.501 0.440
-1 0.120 0.550 0.180 0.540 0.200 0.620 0.115 0.630
-```
+`N` is the number of polygon vertices (can vary per object and per file). `distance_metres` must be `> 0` for a valid reading; non-positive values are treated as missing. Blank lines are ignored.
 
 ### Distance encoding
 
-At parse time, distances are log-clipped and stored as:
-
+At parse time distances are stored as:
 ```python
-dist_stored = log(clip(dist_metres, min_distance, max_distance))
+stored = log(clip(dist_metres, min_distance, max_distance))
 ```
 
-Objects without a valid distance (polygon-only dataset, or distance ≤ 0) are stored with `dist = -10.0` (the sentinel `INVALID_DISTANCE`). The distance loss ignores these entries automatically.
-
-At inference time, distance is recovered as:
-
+Objects without valid distance use the sentinel `INVALID_DISTANCE = -10.0`. The distance loss silently skips these entries. At inference:
 ```python
 dist_metres = clip(exp(pred_distance), min_distance, max_distance)
 ```
 
+### Label cache
+
+The first time a label directory is parsed, a `.npz` cache file is written alongside it:
+
+```
+labels/train/.cache_as15_d0.5_200.0.npz
+```
+
+Subsequent runs load it in milliseconds. The cache is **automatically invalidated** when any `.txt` file's modification time or size changes, or when `angle_step`, `min_distance`, or `max_distance` change.
+
 ---
 
-## 4. Project Structure
+## 5. Project Structure
 
 ```
 yolov8_extended/
 │
 ├── configs/
-│   ├── config.py           # Config dataclasses + YAML + argparse system
-│   └── default.yaml        # All hyperparameter defaults (edit this first)
+│   ├── config.py               # Config dataclasses + YAML + argparse system
+│   └── default.yaml            # All defaults — edit this first
 │
 ├── data/
-│   ├── parsers.py          # V8ParserExtended, V8DistanceParser
-│   └── dataset.py          # PolyDataset, PolyDistDataset, DataLoader factory
+│   ├── parsers.py              # V8ParserExtended, V8DistanceParser, disk cache
+│   └── dataset.py              # PolyDataset, PolyDistDataset, build_dataloader
 │
 ├── models/
-│   └── model.py            # YOLOv8Extended (backbone, neck, all heads)
+│   └── model.py                # YOLOv8Extended + load_pretrained_backbone
 │
 ├── loss/
-│   └── loss.py             # YOLOv8ExtendedLoss + TaskAlignedAssigner
+│   └── loss.py                 # YOLOv8ExtendedLoss + TaskAlignedAssigner
 │
 ├── postprocess/
-│   └── decode.py           # PostProcessor, Detection dataclass
+│   └── decode.py               # PostProcessor, Detection dataclass
 │
 ├── utils/
-│   ├── star_polygon.py     # Star encoding / augmentation helpers
-│   ├── metrics.py          # BBoxF1Metric
-│   ├── logger.py           # Console + CSV + TensorBoard logger
-│   └── visualiser.py       # Per-epoch debug panel generator
+│   ├── star_polygon.py         # Star encoding, augmentation helpers
+│   ├── metrics.py              # BBoxF1Metric
+│   ├── logger.py               # YOLOv8-style progress + CSV + TensorBoard
+│   └── visualiser.py           # Per-epoch debug panels
 │
-├── train.py                # Training entry point
-├── test.py                 # Evaluation entry point
-├── infer.py                # Inference entry point + Predictor class
-└── requirements.txt
+├── train.py                    # Training entry point
+├── test.py                     # Evaluation entry point
+├── infer.py                    # Inference CLI + Predictor class
+└── visualize_dataloader.py     # Standalone dataloader inspection tool
 ```
 
 ---
 
-## 5. Installation
+## 6. Installation
 
 ```bash
-# clone / unzip the project
-cd yolov8_extended
+git clone <repo> && cd yolov8_extended
 
-# create a virtual environment (recommended)
-python -m venv venv && source venv/bin/activate
+python -m venv venv
+# Windows:  venv\Scripts\activate
+# Linux/macOS:  source venv/bin/activate
 
-# install dependencies
 pip install -r requirements.txt
 
-# optional: TensorBoard support
+# recommended: enables pretrained weight download
+pip install ultralytics
+
+# optional: TensorBoard
 pip install tensorboard
 ```
 
@@ -259,278 +281,259 @@ pyyaml>=6.0
 matplotlib>=3.7.0
 ```
 
-### GPU check
-
-```python
-import torch
-print(torch.cuda.is_available())   # should print True
-print(torch.cuda.get_device_name(0))
-```
+**AMD ROCm** — install the ROCm PyTorch wheel from [pytorch.org](https://pytorch.org), then pass `--gpu_type amd --no_amp`. See [Section 16](#16-gpu-compatibility).
 
 ---
 
-## 6. Configuration
+## 7. Configuration System
 
-The configuration system follows a strict three-tier priority:
+All hyperparameters follow a strict three-tier priority:
 
 ```
-defaults (default.yaml)  ←  custom YAML (--cfg)  ←  CLI flags
+configs/default.yaml  <--  --cfg my_exp.yaml  <--  CLI flags
+      lowest                                          highest
 ```
 
 Higher tiers override lower ones. Every parameter is individually addressable.
 
-### default.yaml — annotated
+### Key fields in `default.yaml`
 
 ```yaml
 model:
-  model_size:      "s"      # backbone scale: n / s / m / l / x
-  num_classes:     80       # number of object classes
-  angle_step:      15       # polygon bin width in degrees
-                            # num_angles = 360 // angle_step = 24
-  num_dist_blocks: 1        # ConvBN layers in distance head before final 1×1
-  min_distance:    0.5      # metres — log-distance lower clip
-  max_distance:    200.0    # metres — log-distance upper clip
+  model_size:      "s"       # n / s / m / l / x
+  num_classes:     80
+  angle_step:      15        # polygon bin width in degrees
+  num_dist_blocks: 1         # ConvBN layers in distance head
+  gpu_type:        "nvidia"  # "nvidia" → BN  |  "amd" → GN
+  pretrained:      true      # transfer official YOLOv8 backbone+neck weights
 
 data:
-  poly_dataset_root: "data/polygon"
-  dist_dataset_root: "data/polygon_distance"
-  img_size:    640          # square resolution for training and inference
-  mosaic_prob: 1.0          # probability of using mosaic augmentation
-  hsv_h:       0.015        # hue jitter fraction
-  hsv_s:       0.7          # saturation jitter fraction
-  hsv_v:       0.4          # value jitter fraction
-  flip_lr_prob: 0.5         # horizontal flip probability
+  poly_dataset_root: "data/polygon"   # single-root mode
+  poly_datasets:     []               # multi-dataset mode (overrides above)
+  poly_weights:      []               # per-dataset sampling weights
+  dist_dataset_root: ""               # distance dataset (empty = disabled)
+  class_names:       []               # for visualisation labels
+  img_size:    640
   batch_size:  16
-  num_workers: 4
 
 train:
-  epochs:        300
-  warmup_epochs: 3          # linear LR warm-up for first N epochs
-  lr0:           0.01       # initial LR (peak after warm-up)
-  lrf:           0.01       # final LR = lr0 * lrf (cosine decay target)
-  momentum:      0.937
-  weight_decay:  0.0005
-  # loss gains
-  box_gain:        7.5
-  cls_gain:        0.5
-  dfl_gain:        1.5
-  poly_gain:       0.1      # total polygon loss multiplier
-  dist_gain:       0.1      # scalar distance loss multiplier
-  poly_dist_gain:  2.0      # polygon radial distance sub-loss gain
-  poly_conf_gain:  0.2      # polygon confidence sub-loss gain
-  poly_angle_gain: 0.5      # polygon angle sub-loss gain
-  # runtime
-  device:       "cuda"
-  save_dir:     "runs/train"
-  val_interval: 5           # validate every N epochs
-  conf_thres:   0.5
-  iou_thres:    0.45
-  # logging
-  log_interval:   10        # print step loss every N steps
-  vis_interval:   1         # save debug panels every N epochs
-  vis_max_images: 8
-  tensorboard:    true
+  epochs:       300
+  lr0:          0.01
+  save_dir:     "runs/train"   # actual dir = runs/train/exp1, exp2, ...
+  val_interval: 5
 ```
 
 ### Creating an experiment config
 
-Copy and edit the defaults for your experiment:
+Copy and modify the defaults — only changed fields need to appear:
 
 ```bash
 cp configs/default.yaml configs/my_experiment.yaml
-# edit configs/my_experiment.yaml
 python train.py --cfg configs/my_experiment.yaml
 ```
 
-Only the fields you change need to appear in your YAML — all others inherit from `default.yaml`.
+The **effective config** (merged result of all three tiers) is automatically saved to `{save_dir}/config.yaml` at the start of every run for exact reproducibility.
 
 ---
 
-## 7. Training
+## 8. Training
 
-### Quickstart
+### Quick start
+
+```bash
+python train.py \
+    --poly_dataset_root data/polygon \
+    --num_classes 10 \
+    --model_size s \
+    --epochs 300
+```
+
+The first run creates `runs/train/exp1/`. A second run creates `runs/train/exp2/` and so on — no overwriting.
+
+### Multiple polygon datasets with sampling weights
+
+```bash
+python train.py \
+    --poly_datasets \
+        data/dataset_a/images/train:data/dataset_a/labels/train \
+        data/dataset_b/images/train:data/dataset_b/labels/train \
+        data/dataset_c/images/train:data/dataset_c/labels/train \
+    --poly_weights 3.0 1.0 1.0 \
+    --num_classes 10
+```
+
+Dataset A will be sampled 3× more frequently than B or C. Weights are normalised internally so only relative values matter. Uses `torch.utils.data.WeightedRandomSampler` under the hood.
+
+Equivalently in YAML:
+```yaml
+data:
+  poly_datasets:
+    - "data/dataset_a/images/train:data/dataset_a/labels/train"
+    - "data/dataset_b/images/train:data/dataset_b/labels/train"
+  poly_weights: [3.0, 1.0]
+```
+
+### With an optional distance dataset
 
 ```bash
 python train.py \
     --poly_dataset_root data/polygon \
     --dist_dataset_root data/polygon_distance \
-    --num_classes 10 \
-    --model_size s \
-    --epochs 300 \
-    --save_dir runs/exp1
+    --num_classes 10
 ```
 
-### Full CLI reference — `train.py`
+The distance dataset is independent and entirely optional. The distance loss only fires for objects that have a valid distance label; all other objects contribute only to box, class, and polygon losses.
+
+### Pretrained weights
+
+Enabled by default. The official ultralytics weights are downloaded automatically on first run (requires `pip install ultralytics` or internet).
+
+```bash
+# disable
+python train.py --no_pretrained
+
+# check what was transferred (logged at start)
+# Pretrained weights loaded  matched=214  skipped_shape=12  ...
+```
+
+Only backbone and neck parameters are transferred. All three heads (detection, polygon, distance) are always randomly initialised.
+
+### Resume training
+
+```bash
+python train.py --resume runs/train/exp1/last.pt
+```
+
+Resumes from the saved epoch and optimiser state. The save directory is inherited from the checkpoint — no new `expN` folder is created.
+
+### Common recipes
+
+**Fast debugging:**
+```bash
+python train.py \
+    --poly_dataset_root data/polygon --num_classes 5 \
+    --model_size n --epochs 20 --batch_size 4 --img_size 416 \
+    --val_interval 2 --vis_interval 1 --mosaic_prob 0.0 --no_pretrained
+```
+
+**AMD GPU:**
+```bash
+python train.py \
+    --poly_dataset_root data/polygon --num_classes 10 \
+    --gpu_type amd --no_amp
+```
+
+### Full CLI reference
 
 ```
-Model arguments:
-  --model_size {n,s,m,l,x}    Backbone scale (default: s)
-  --num_classes INT            Number of object classes (default: 80)
-  --angle_step INT             Polygon bin width in degrees (default: 15)
-  --num_dist_blocks INT        ConvBN layers in distance head (default: 1)
-  --min_distance FLOAT         Distance clip lower bound, metres (default: 0.5)
-  --max_distance FLOAT         Distance clip upper bound, metres (default: 200.0)
+Config:
+  --cfg PATH                      YAML config file
 
-Data arguments:
-  --poly_dataset_root PATH     Root directory for polygon dataset
-  --dist_dataset_root PATH     Root directory for polygon+distance dataset
-  --img_size INT               Input resolution (default: 640)
-  --batch_size INT             (default: 16)
-  --num_workers INT            DataLoader workers (default: 4)
-  --mosaic_prob FLOAT          Mosaic augmentation probability (default: 1.0)
-  --flip_lr_prob FLOAT         Horizontal flip probability (default: 0.5)
-  --hsv_h / --hsv_s / --hsv_v  HSV colour jitter fractions
+Model:
+  --model_size {n,s,m,l,x}        default: s
+  --num_classes INT                default: 80
+  --angle_step INT                 polygon bin width in degrees, default: 15
+  --num_dist_blocks INT            distance head depth, default: 1
+  --min_distance METRES            default: 0.5
+  --max_distance METRES            default: 200.0
+  --gpu_type {nvidia,amd}          normalisation layer, default: nvidia
+  --no_pretrained                  skip backbone weight transfer
 
-Training arguments:
-  --epochs INT                 (default: 300)
-  --warmup_epochs INT          Linear LR warm-up length (default: 3)
-  --lr0 FLOAT                  Initial / peak learning rate (default: 0.01)
-  --lrf FLOAT                  Final LR multiplier for cosine decay (default: 0.01)
-  --momentum FLOAT             SGD momentum (default: 0.937)
-  --weight_decay FLOAT         (default: 0.0005)
-  --device STR                 "cuda" or "cpu" (default: cuda)
-  --save_dir PATH              Experiment output directory (default: runs/train)
-  --val_interval INT           Validate every N epochs (default: 5)
-  --conf_thres FLOAT           Object confidence threshold (default: 0.5)
-  --iou_thres FLOAT            NMS IoU threshold (default: 0.45)
-  --resume PATH                Resume from a checkpoint file
+Data:
+  --poly_dataset_root PATH         single dataset root
+  --poly_datasets IMG:LBL [...]    multiple datasets as img_dir:lbl_dir pairs
+  --poly_weights W [...]           per-dataset sampling weights (parallel list)
+  --dist_dataset_root PATH         distance dataset root (optional)
+  --class_names NAME [...]         class name strings for visualisation
+  --img_size INT                   default: 640
+  --batch_size INT                 default: 16
+  --num_workers INT                default: 4
+  --mosaic_prob FLOAT              default: 1.0
+  --flip_lr_prob FLOAT             default: 0.5
+  --hsv_h / --hsv_s / --hsv_v     HSV jitter fractions
+
+Training:
+  --epochs INT                     default: 300
+  --warmup_epochs INT              default: 3
+  --lr0 FLOAT                      initial / peak LR, default: 0.01
+  --lrf FLOAT                      final LR multiplier for cosine decay, default: 0.01
+  --momentum FLOAT                 default: 0.937
+  --weight_decay FLOAT             default: 0.0005
+  --device STR                     default: cuda
+  --save_dir PATH                  base dir, auto-incremented, default: runs/train
+  --val_interval INT               default: 5
+  --conf_thres FLOAT               default: 0.5
+  --iou_thres FLOAT                default: 0.45
+  --resume PATH                    resume from checkpoint
+  --no_amp                         disable AMP (required for some AMD setups)
 
 Loss gains:
-  --box_gain FLOAT             (default: 7.5)
-  --cls_gain FLOAT             (default: 0.5)
-  --dfl_gain FLOAT             (default: 1.5)
-  --poly_gain FLOAT            Total polygon loss multiplier (default: 0.1)
-  --dist_gain FLOAT            Scalar distance loss multiplier (default: 0.1)
-  --poly_dist_gain FLOAT       (default: 2.0)
-  --poly_conf_gain FLOAT       (default: 0.2)
-  --poly_angle_gain FLOAT      (default: 0.5)
+  --box_gain / --cls_gain / --dfl_gain
+  --poly_gain / --dist_gain
+  --poly_dist_gain / --poly_conf_gain / --poly_angle_gain
 
 Logging & Visualisation:
-  --cfg PATH                   Path to YAML config (overrides defaults)
-  --log_interval INT           Print step loss every N steps (default: 10)
-  --vis_interval INT           Save debug panels every N epochs (default: 1)
-  --vis_max_images INT         Max images per panel grid (default: 8)
-  --no_tensorboard             Disable TensorBoard logging
-```
-
-### Resume from checkpoint
-
-```bash
-python train.py --resume runs/exp1/last.pt
-```
-
-The checkpoint stores epoch number, model weights, optimiser state, and best F1. Training resumes from the next epoch automatically.
-
-### Common training recipes
-
-**Small dataset, fast iteration:**
-```bash
-python train.py \
-    --epochs 100 --batch_size 8 --img_size 416 \
-    --val_interval 2 --vis_interval 2 \
-    --model_size n
-```
-
-**Production run, medium model:**
-```bash
-python train.py \
-    --cfg configs/default.yaml \
-    --model_size m --num_classes 20 \
-    --epochs 300 --lr0 0.01 --batch_size 32 \
-    --save_dir runs/production
-```
-
-**Fine-tuning with a lower LR:**
-```bash
-python train.py \
-    --resume runs/production/best.pt \
-    --lr0 0.001 --lrf 0.001 \
-    --epochs 50 --save_dir runs/finetune
-```
-
-**Disable mosaic for debugging:**
-```bash
-python train.py --mosaic_prob 0.0 --vis_interval 1
+  --log_interval INT               log step loss every N steps, default: 10
+  --vis_interval INT               save debug panels every N epochs, default: 1
+  --vis_max_images INT             max images per panel, default: 8
+  --no_tensorboard                 disable TensorBoard logging
 ```
 
 ### Output files
 
 ```
-runs/exp1/
-├── best.pt             # checkpoint with highest val F1
-├── last.pt             # checkpoint from last validation epoch
-├── config.yaml         # effective config (exact reproducibility)
-├── logs/
-│   ├── train.log       # full training log (DEBUG level)
-│   ├── metrics.csv     # all scalars, one row per step/epoch
-│   └── tb/             # TensorBoard event files
-└── vis/
-    ├── epoch_0000/
-    │   ├── train_batch.png
-    │   ├── val_pred.png
-    │   ├── loss_curves.png
-    │   └── polygon_debug.png
-    ├── epoch_0005/
-    │   └── ...
-    └── ...
+runs/train/
+└── exp1/
+    ├── best.pt             # checkpoint with highest val F1
+    ├── last.pt             # most recent checkpoint
+    ├── config.yaml         # effective merged config (reproducibility)
+    ├── logs/
+    │   ├── train.log       # full DEBUG trace
+    │   ├── metrics.csv     # all scalars per step/epoch
+    │   └── tb/             # TensorBoard event files
+    └── vis/
+        ├── epoch_0000/
+        │   ├── train_batch.png
+        │   ├── val_compare.png
+        │   ├── loss_curves.png
+        │   └── polygon_debug.png
+        └── epoch_0005/
+            └── ...
 ```
 
 ---
 
-## 8. Validation & Testing
-
-### Running evaluation
+## 9. Validation & Testing
 
 ```bash
+# evaluate on test split
 python test.py \
-    --weights runs/exp1/best.pt \
+    --weights runs/train/exp1/best.pt \
     --poly_img data/polygon/images/test \
     --poly_lbl data/polygon/labels/test
-```
 
-**With distance dataset:**
-```bash
+# load config from saved experiment (ensures matching hyperparameters)
 python test.py \
-    --weights runs/exp1/best.pt \
+    --cfg runs/train/exp1/config.yaml \
+    --weights runs/train/exp1/best.pt \
+    --poly_img data/polygon/images/test \
+    --poly_lbl data/polygon/labels/test
+
+# custom IoU matching threshold
+python test.py \
+    --weights runs/train/exp1/best.pt \
     --poly_img data/polygon/images/test \
     --poly_lbl data/polygon/labels/test \
-    --dist_img data/polygon_distance/images/test \
-    --dist_lbl data/polygon_distance/labels/test
+    --iou_metric 0.75
 ```
 
-**Load config from saved experiment:**
-```bash
-python test.py \
-    --cfg runs/exp1/config.yaml \
-    --weights runs/exp1/best.pt \
-    --poly_img data/polygon/images/test \
-    --poly_lbl data/polygon/labels/test
+### Metric: Bounding-box F1
+
+The validation and test metric is **micro-averaged F1** computed via bounding-box IoU matching (threshold 0.5 by default). Polygon and distance quality are evaluated qualitatively via the `val_compare.png` visualisation panels.
+
+Sample output:
 ```
-
-### CLI reference — `test.py`
-
-```
-  --weights PATH       Required. Checkpoint to evaluate
-  --poly_img PATH      Required. Test polygon images directory
-  --poly_lbl PATH      Required. Test polygon labels directory
-  --dist_img PATH      Test distance images (falls back to poly_img)
-  --dist_lbl PATH      Test distance labels (falls back to poly_lbl)
-  --iou_metric FLOAT   IoU threshold for TP/FP matching (default: 0.5)
-  --conf_thres FLOAT   Detection confidence threshold
-  --cfg PATH           Load settings from YAML
-```
-
-### Metric: F1 score
-
-The validation metric is **bbox-only F1** computed via IoU matching (default IoU threshold = 0.5). Polygon and distance are not included in the metric — they are monitored via the visualisation panels during training.
-
-The metric reports:
-- **Per-class** precision, recall, F1
-- **Micro-averaged** precision, recall, F1 (all classes combined)
-
-Example output:
-```
-── Per-class results (IoU@0.5) ──────────────────────────────
+── Per-class results (IoU@0.5) ──────────────────────
   class_0         P=0.8712  R=0.8103  F1=0.8396
   class_1         P=0.9105  R=0.8820  F1=0.8960
   class_2         P=0.7840  R=0.7590  F1=0.7713
@@ -540,286 +543,333 @@ Example output:
 
 ---
 
-## 9. Inference
+## 10. Inference
 
 ### CLI
 
 ```bash
 # single image
-python infer.py --weights runs/exp1/best.pt --source image.jpg
+python infer.py --weights runs/train/exp1/best.pt --source image.jpg
 
-# directory of images
+# directory
 python infer.py \
-    --weights runs/exp1/best.pt \
+    --weights runs/train/exp1/best.pt \
     --source images/ \
     --save_dir predictions/ \
-    --conf_thres 0.4 \
-    --class_names person car truck bicycle
+    --class_names person car truck \
+    --conf_thres 0.4
 
-# disable polygon / distance overlay
+# disable overlays
 python infer.py \
-    --weights runs/exp1/best.pt \
+    --weights runs/train/exp1/best.pt \
     --source images/ \
     --no_polygon --no_distance
-
-# load full config from saved experiment
-python infer.py \
-    --cfg runs/exp1/config.yaml \
-    --weights runs/exp1/best.pt \
-    --source images/
-```
-
-### CLI reference — `infer.py`
-
-```
-  --weights PATH           Required. Checkpoint to run
-  --source PATH            Required. Image file or directory
-  --save_dir PATH          Output directory for annotated images (default: out)
-  --class_names STR [...]  Optional list of class name strings
-  --no_polygon             Suppress polygon drawing
-  --no_distance            Suppress distance label drawing
-  --conf_thres FLOAT       Detection confidence threshold
-  --iou_thres FLOAT        NMS IoU threshold
-  --cfg PATH               Load settings from YAML
 ```
 
 ### Programmatic API
-
-Use the `Predictor` class to integrate inference into a pipeline:
 
 ```python
 import cv2
 from infer import Predictor
 
-# load once
-predictor = Predictor("runs/exp1/best.pt")
+predictor = Predictor("runs/train/exp1/best.pt")
 
-# run on any BGR numpy image
-img = cv2.imread("image.jpg")
+img        = cv2.imread("image.jpg")
 detections = predictor(img)
 
 for d in detections:
     print(d)
-    # Detection(cls=0, score=0.923, dist=12.4m, bbox=[120, 80, 340, 310], poly_pts=18)
+    # Detection(cls=0, score=0.923, dist=12.4m, bbox=[120,80,340,310], poly_pts=18)
 
-    # attributes
-    d.bbox        # np.ndarray (4,)  x1,y1,x2,y2 in original pixel coords
+    d.bbox        # np.ndarray (4,)   x1,y1,x2,y2  in original pixel coords
     d.cls         # int
-    d.score       # float   overall confidence
-    d.distance    # float   metres
-    d.polygon     # np.ndarray (K, 2)  pixel coords, conf-filtered vertices
-    d.poly_conf   # np.ndarray (num_angles,)  per-bin confidence
+    d.score       # float
+    d.distance    # float  metres
+    d.polygon     # np.ndarray (K, 2)  pixel coords, conf-filtered
+    d.poly_conf   # np.ndarray (num_angles,)  raw per-bin confidence
 
 # draw and save
 vis = predictor.draw(img, detections, class_names=["person", "car"])
 cv2.imwrite("result.jpg", vis)
 ```
 
-### Output format
+---
 
-Each `Detection` object carries:
+## 11. Dataloader Visualiser
 
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `bbox` | `np.ndarray (4,)` | `[x1, y1, x2, y2]` in original pixel coordinates |
-| `cls` | `int` | Class index |
-| `score` | `float` | Object confidence (max class score) |
-| `distance` | `float` | Predicted metric depth in metres |
-| `polygon` | `np.ndarray (K, 2)` | Polygon vertices in original pixel coords (K ≤ num_angles, conf-filtered) |
-| `poly_conf` | `np.ndarray (num_angles,)` | Raw per-bin confidence values |
+Inspect **exactly what the model receives** — letterboxed images with remapped labels rendered back to pixel space.
+
+```bash
+# save panels, no augmentation
+python visualize_dataloader.py \
+    --poly_dataset_root data/polygon \
+    --dist_dataset_root data/polygon_distance \
+    --num_classes 10 \
+    --class_names person car truck \
+    --save_dir vis_check/
+
+# interactive window
+python visualize_dataloader.py \
+    --poly_dataset_root data/polygon \
+    --show --batch_size 4
+
+# augmented training view
+python visualize_dataloader.py \
+    --poly_dataset_root data/polygon \
+    --aug --n_batches 3 --save_dir vis_aug/
+```
+
+### Panel annotations
+
+| Element | Appearance |
+|---------|-----------|
+| Bounding box | Per-object colour, labelled class + distance |
+| Polygon ray | Line from origin to each active vertex |
+| Active vertex | Filled circle |
+| Inactive bin stub | Short dim grey line showing expected angle |
+| Polygon outline | Connects active vertices in angle order |
+| Padding boundary | Dark grey rectangle marking the letterbox image area |
+| `OOB` label | Red text on any object whose centre falls outside the image area |
+
+### Console sanity check output
+
+```
+Batch 0  —  4 images, 22 objects total
+  classes   : [0, 1, 3, 7]
+  bbox cx   : [0.183, 0.891]
+  dist valid: 8/22  range [2.3, 45.1]m
+  ✓  all 187 active polygon vertices within [0, 1]
+```
+
+Run this **before starting a long training run** to catch dataset or coordinate mapping issues early.
 
 ---
 
-## 10. Logging & Visualisation
+## 12. Training Visualisations
+
+Four debug panels saved to `{save_dir}/vis/epoch_{N:04d}/` every `vis_interval` epochs, and forwarded to TensorBoard.
+
+### `train_batch.png`
+
+Grid of augmented training images with GT annotations: bounding boxes with class + distance labels, full star polygon rays, active vertex dots, inactive bin stubs, and a per-image stat bar showing object count and distance flag.
+
+### `val_compare.png`
+
+Side-by-side per-image comparison:
+- **Left** — Ground truth in lime green with polygon rays
+- **Right** — Model predictions in per-class colours with polygon outlines
+- **Confidence strip** — Horizontal bar under predictions, green = high confidence, red = low
+
+### `loss_curves.png`
+
+Dark-theme matplotlib grid: one subplot per loss component (`total`, `box`, `cls`, `dfl`, `poly_dist`, `poly_conf`, `poly_ang`, `dist`) plus subplots for val F1, val Precision, and val Recall. Raw curve overlaid with EMA-smoothed line. Dashed vertical lines mark each validation epoch.
+
+### `polygon_debug.png`
+
+Per-object ray diagram: each active bin annotated with angle in degrees and pixel distance from origin; inactive bins shown as dim stubs.
+
+---
+
+## 13. Logging
+
+### Console
+
+YOLOv8-style progress display — overwrites the same line every step:
+
+```
+──────────────────────────────────────────────────────────────────────────────
+  Epoch   GPU-mem       box       cls       dfl      poly      dist  Instances  ImgSize
+──────────────────────────────────────────────────────────────────────────────
+    1/300    2.14G    7.4321    0.5210    1.2300    0.0821    0.0000        42      640  ━━━━━━━━━━━━━━━━━━━━ 200/200  23s/epoch  eta 01:55:00
+
+  Validation  P=0.7821  R=0.7103  F1=0.7445  ★ NEW BEST
+```
+
+### File log
+
+`logs/train.log` — full DEBUG trace including every step's loss values, gradient norms, and checkpoint events.
+
+### CSV
+
+`logs/metrics.csv` — one row per step and per epoch:
+
+```python
+import pandas as pd
+df    = pd.read_csv("runs/train/exp1/logs/metrics.csv")
+train = df[df.mode == "train"]
+val   = df[df.mode == "val"]
+```
+
+Columns: `timestamp, mode, epoch, step, loss, box, cls, dfl, poly_dist, poly_conf, poly_ang, dist, lr, precision, recall, f1`
 
 ### TensorBoard
 
 ```bash
-# start TensorBoard pointing at the experiment logs
-tensorboard --logdir runs/exp1/logs/tb
-
+tensorboard --logdir runs/train/exp1/logs/tb
 # or watch all experiments
 tensorboard --logdir runs/
 ```
 
-TensorBoard tracks:
-
-| Tag | Description |
-|-----|-------------|
-| `step/loss_total` | Per-step total loss |
-| `step/{component}` | Per-step individual loss components |
-| `step/lr` | Learning rate at each step |
-| `train/loss` | Epoch-averaged total loss |
-| `train/{component}` | Epoch-averaged component losses |
-| `train/lr` | LR at epoch end |
-| `train/grad_norm` | Gradient norm (after clipping) |
-| `val/precision` | Validation precision |
-| `val/recall` | Validation recall |
-| `val/f1` | Validation F1 (primary metric) |
-| `val_per_class/{cls}_f1` | Per-class F1 |
-| `vis/train_batch` | GT-annotated training images |
-| `vis/val_pred` | GT vs predicted overlay |
-| `vis/loss_curves` | Loss curve grid |
-| `vis/polygon_debug` | Star polygon ray visualisation |
-
-### CSV metrics
-
-`logs/metrics.csv` is appended every step and every epoch:
-
-```
-timestamp, mode, epoch, step, loss, box, cls, dfl, poly_dist, poly_conf, poly_ang, dist, lr, precision, recall, f1
-2024-01-15 10:23:41, train, 0, 0, 12.3401, 3.2100, 1.0800, 0.9200, 2.1000, 0.3200, 0.8100, 0.0500, 0.003333, 0, 0, 0
-2024-01-15 10:24:55, val, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.7200, 0.6900, 0.7047
-```
-
-Plot with pandas:
-```python
-import pandas as pd, matplotlib.pyplot as plt
-
-df = pd.read_csv("runs/exp1/logs/metrics.csv")
-train = df[df.mode == "train"]
-val   = df[df.mode == "val"]
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-train.groupby("epoch")["loss"].mean().plot(ax=axes[0], title="Train Loss")
-val.set_index("epoch")["f1"].plot(ax=axes[1], title="Val F1", marker="o")
-plt.tight_layout(); plt.show()
-```
-
-### Visualisation panels
-
-Saved to `vis/epoch_NNNN/` every `vis_interval` epochs:
-
-**`train_batch.png`** — Augmented training images annotated with ground-truth boxes and star polygon rays. Useful for verifying augmentation correctness.
-
-**`val_pred.png`** — Ground truth overlaid in green, model predictions in red. Lets you visually track precision/recall improvement epoch-by-epoch without waiting for full metric computation.
-
-**`loss_curves.png`** — One subplot per loss component (box, cls, dfl, poly_dist, poly_conf, poly_angle, dist) plus a val-F1 subplot, all plotted from epoch 0 to the current epoch.
-
-**`polygon_debug.png`** — Single-image close-up showing each angle bin's ray from the polygon origin. Active bins (conf ≥ threshold) are coloured; inactive bins show a short dim stub. The angle label at each ray midpoint shows the bin's starting angle in degrees.
+Key tags: `train/loss`, `train/{component}`, `train/grad_norm`, `val/f1`, `val/precision`, `val/recall`, `val_per_class/{cls}_f1`, `vis/train_batch`, `vis/val_compare`, `vis/loss_curves`, `vis/polygon_debug`.
 
 ---
 
-## 11. Loss Functions
+## 14. Loss Functions
 
 ### Total loss
 
 ```
-L_total = box_gain  × L_box
-        + cls_gain  × L_cls
-        + dfl_gain  × L_dfl
-        + poly_gain × (poly_dist_gain  × L_poly_dist
-                      + poly_conf_gain  × L_poly_conf
-                      + poly_angle_gain × L_poly_angle)
-        + dist_gain × L_distance
+L = box_gain  × L_box
+  + cls_gain  × L_cls
+  + dfl_gain  × L_dfl
+  + poly_gain × (poly_dist_gain  × L_poly_dist
+                + poly_conf_gain  × L_poly_conf
+                + poly_angle_gain × L_poly_angle)
+  + dist_gain × L_distance
 
-L_total = L_total × batch_size
+L = L × batch_size
 ```
+
+Default gains: `box=7.5, cls=0.5, dfl=1.5, poly=0.1, dist=0.1, poly_dist=2.0, poly_conf=0.2, poly_angle=0.5`.
 
 ### Assignment
 
-All losses use the **TaskAlignedAssigner** (top-13 selection by `cls_score^0.5 × iou^6.0`). The assigner is shared between the box/cls and polygon branches — the polygon head targets are derived from the same assigned GT.
+All losses share the **TaskAlignedAssigner** (top-13, alignment metric = `cls_score^0.5 × IoU^6.0`).
 
-### Box loss
+### Polygon sub-losses
 
-- **CIoU** between predicted and GT bounding boxes
-- **DFL** (Distribution Focal Loss) on the LTRB offsets from anchor centres
-- Both weighted by the per-anchor IoU alignment score
+All three masked by both the foreground anchor mask and the per-bin `conf > 0` mask.
 
-### Polygon loss (3 sub-components)
+**Radial distance** — MSE between `softplus(pred_dist)` and Euclidean distance from origin to GT vertex. Normalised by `num_active_vertices × num_fg_anchors`.
 
-All three are masked by the foreground anchor mask AND the per-bin `target_conf` mask.
+**Angle fractional** — BCE between `sigmoid(pred_angle)` and the fractional GT angle within its bin: `frac = (angle_deg − bin × step) / step`.
 
-**Radial distance loss** (`L_poly_dist`): MSE between the softplus-activated predicted distance and the GT Euclidean distance from the origin to each active vertex.
-
-**Angle fractional loss** (`L_poly_angle`): BCE between `sigmoid(pred_angle)` and the fractional part of the ground-truth angle within its bin `frac = (angle - bin * step) / step ∈ [0, 1)`.
-
-**Confidence loss** (`L_poly_conf`): BCE with logits across all bins (both active and inactive).
+**Confidence** — BCE across all `num_angles` bins (active target=1, inactive target=0).
 
 ### Scalar distance loss
 
-L1 loss, computed only on foreground anchors whose assigned GT has a valid distance (≠ `INVALID_DISTANCE = -10.0`). Normalised by the count of valid objects in the batch.
+L1 loss on foreground anchors with valid distance labels (`≠ INVALID_DISTANCE`). Objects from polygon-only datasets contribute zero gradient to this loss.
 
 ---
 
-## 12. Post-Processing
+## 15. Post-Processing
 
-### Decode pipeline
-
-1. **Box**: DFL softmax over REG_MAX=16 bins → LTRB offsets → x1y1x2y2 in normalised coords.
-2. **Class**: sigmoid → max class score and class id.
-3. **Confidence filter**: keep anchors with `max_cls_score ≥ conf_thres`.
-4. **NMS**: greedy IoU-based NMS per class.
-5. **Polygon decode** (for surviving anchors):
-   - `poly_dist  = softplus(pred_dist)`   → radial distance per bin
-   - `poly_angle = sigmoid(pred_angle)`   → fractional bin offset
+1. **Box** — DFL softmax → LTRB offsets → `x1y1x2y2` normalised.
+2. **Class** — sigmoid → max score and class id.
+3. **Confidence filter** — `max_cls_score ≥ conf_thres`.
+4. **NMS** — greedy IoU NMS, no external library.
+5. **Polygon decode**:
+   - `poly_dist  = softplus(raw_dist)`
+   - `poly_angle = sigmoid(raw_angle)` — fractional bin offset in `[0, 1)`
    - `abs_angle  = (poly_angle + bin_offset) / num_angles × 360`
    - `dx = dist × cos(abs_angle)`,  `dy = dist × sin(abs_angle)`
-   - `poly_x = origin_x − dx / img_size × stride`
+   - `poly_x = origin_x − dx / img_size × stride`  (note: subtraction as specified)
    - `poly_y = origin_y − dy / img_size × stride`
-   - Confidence-filter with `poly_conf_thres = 0.5`
+   - Confidence-filter vertices with `poly_conf_thres = 0.5`
    - Scale to original image size
-6. **Distance decode**: `dist_metres = clip(exp(pred_distance), min, max)`
-
-### NMS behaviour
-
-NMS operates on the bounding box; polygon and distance are carried as attributes and are **not** used in suppression. Only one NMS call per image (across all classes simultaneously).
+6. **Distance** — `clip(exp(pred_dist), min_distance, max_distance)`
 
 ---
 
-## 13. Extending the Codebase
+## 16. GPU Compatibility
+
+### NVIDIA (CUDA)
+
+Fully supported. Mixed precision (AMP) enabled by default.
+
+### AMD (ROCm)
+
+ROCm maps its HIP/MIOpen stack onto the CUDA API. Two issues arise on newer GPUs (RX 9070/9080, `gfx1201`):
+
+**MIOpen JIT failure (BatchNorm)**
+
+```
+MIOpen(HIP): Error [Compile] … 'type_traits' file not found
+RuntimeError: miopenStatusUnknownError
+```
+
+Fix — use GroupNorm (no MIOpen JIT required):
+```bash
+python train.py --gpu_type amd
+```
+
+**AMP instability on older ROCm builds**
+```bash
+python train.py --gpu_type amd --no_amp
+```
+
+**Alternative workaround** (keep BatchNorm, disable cuDNN):
+```bash
+set MIOPEN_DEBUG_DISABLE_FIND_DB=1
+set MIOPEN_FIND_MODE=1
+python train.py --no_amp
+```
+
+### Windows
+
+- `num_workers > 0` can hang; use `--num_workers 0` if you see freezing at startup.
+- ANSI colour codes work in Windows Terminal and VS Code; fall back to plain text in `cmd.exe`.
+
+---
+
+## 17. Extending the Codebase
 
 ### Adding a new augmentation
 
-1. Implement the spatial transform in `utils/star_polygon.py`, following `flip_lr_star` as a template — operate in polar form where possible.
-2. Apply it in `data/dataset.py` inside `_BasePolyDataset.__getitem__`, updating both image and star targets together.
+Implement the transform in `utils/star_polygon.py` in polar/star form (see `flip_lr_star` as a template), then apply it in `data/dataset.py` inside `__getitem__`, updating both the image and the star target together.
 
-### Adding a new head
+### Adding a new output head
 
 1. Define the `nn.Module` in `models/model.py`.
-2. Register it in `YOLOv8Extended.__init__` as an `nn.ModuleList` over the 3 FPN scales.
+2. Register it as an `nn.ModuleList` over the 3 FPN scales in `YOLOv8Extended.__init__`.
 3. Return its output from `forward()`.
-4. Add the corresponding loss in `loss/loss.py` and a gain in `TrainConfig`.
-5. Add decoding in `postprocess/decode.py` and store the result in `Detection`.
+4. Add the loss term in `loss/loss.py` and a gain to `TrainConfig`.
+5. Add decoding in `postprocess/decode.py` and a field to `Detection`.
 
-### Changing the polygon bin resolution
+### Adding a dataset parser
 
-```yaml
-# configs/my_exp.yaml
-model:
-  angle_step: 10    # 36 bins instead of 24
-```
+Subclass `_BasePolyDataset` in `data/dataset.py` and override `_make_parser()` to return your parser. The parser must implement `parse_dir(label_dir) → dict[str, np.ndarray]`.
 
-`num_angles` is derived automatically. No other changes needed — the star format and all downstream code adapt to the new bin count.
+### Swapping in the real ultralytics backbone
 
-### Using with ultralytics backbone
-
-Replace `YOLOv8Backbone` and `YOLOv8Neck` in `models/model.py` with the real ultralytics modules. The `DetHead`, `PolyHead`, and `DistHead` attach to the neck outputs unchanged, requiring only that the input channel counts match.
+Replace `YOLOv8Backbone` and `YOLOv8Neck` in `models/model.py` with the real ultralytics modules. The heads attach to the neck outputs unchanged — only channel counts need to match.
 
 ---
 
-## 14. Troubleshooting
+## 18. Troubleshooting
 
 **`CUDA out of memory`**
-Reduce `--batch_size` or `--img_size`. As a guideline: `s` model at 640px uses ~6 GB at batch 16.
+Reduce `--batch_size` or `--img_size`. The `s` model at 640 px uses ~6 GB at batch 16.
 
-**`No images found`**
-The dataloader expects `<dataset_root>/images/train/` and `<dataset_root>/labels/train/`. Check the directory structure matches exactly and that image extensions are `.jpg`, `.jpeg`, `.png`, or `.bmp`.
+**Boxes and polygons appear in the grey letterbox padding**
+A `_flip_targets_lr` function was missing in an earlier version. Ensure you are on the current `data/dataset.py` and clear `__pycache__`:
+```bash
+# Windows
+for /r %d in (__pycache__) do @rmdir /s /q "%d"
+# Linux / macOS
+find . -type d -name __pycache__ -exec rm -rf {} +
+```
 
-**`KeyError: 'model'` when loading checkpoint**
-Pass the raw state dict: the checkpoint saves `{"model": state_dict, ...}`. If you're loading a raw `state_dict` file, it will be detected automatically.
+**`RuntimeError: shape '[N, -1, 3]' is invalid`** in `visualize_dataloader.py`
+Delete `__pycache__` as above — stale `.pyc` bytecode from a previous bug.
 
-**Polygon rays all pointing in the same direction**
-Usually means the `angle_step` used at training differs from the value used at inference. Always load the experiment's `config.yaml` with `--cfg` when running `test.py` or `infer.py`.
+**`No weights were matched` when loading pretrained weights**
+The layer-index map in `load_pretrained_backbone` covers the standard YOLOv8 architecture. If you've modified channel widths, the shapes will not match and the count will be low. Pass `--no_pretrained` or add mappings to `LAYER_TO_MODULE` in `model.py`.
 
-**Loss is NaN after a few steps**
-Check that `min_distance > 0` (log of zero is −∞) and that label coordinates are truly normalised to [0, 1]. Try reducing `lr0` and confirming gradient clipping is active (`max_norm=10.0` in the training loop).
+**Loss is NaN**
+Ensure `min_distance > 0` (log of zero is −∞). Verify label coordinates are in `[0, 1]`. Try reducing `--lr0`.
 
-**TensorBoard not showing up**
-Install with `pip install tensorboard` and ensure you point `--logdir` at `runs/<exp>/logs/tb/`, not the experiment root.
+**Val F1 stays at 0**
+The default IoU matching threshold is 0.5. Pass `--iou_metric 0.3` in `test.py` to diagnose whether boxes are slightly offset. Confirm GT class indices match predictions.
 
-**Val F1 = 0 despite visible detections**
-The default IoU matching threshold for F1 is 0.5. If predicted boxes are slightly offset (common early in training), try `--iou_metric 0.3` in `test.py` to diagnose. Also confirm GT labels have the correct class index.
+**`num_workers > 0` hangs on Windows**
+Pass `--num_workers 0`.
+
+**TensorBoard shows no data**
+Point `--logdir` to `{save_dir}/logs/tb/` not the experiment root. Verify `pip install tensorboard`.
+
+**Cache not updating after editing labels**
+The cache checks file `mtime` and `size`. If mtime is unchanged after an edit, delete the `.cache_*.npz` files from the label directories manually.
 
 ---
 
@@ -827,7 +877,7 @@ The default IoU matching threshold for F1 is 0.5. If predicted boxes are slightl
 
 If you build on this work, please also cite the original YOLOv8:
 
-```
+```bibtex
 @software{yolov8_ultralytics,
   author  = {Glenn Jocher and Ayush Chaurasia and Jing Qiu},
   title   = {Ultralytics YOLOv8},
