@@ -1,0 +1,56 @@
+# ── YOLOv8-Extended default configuration ────────────────────────────────────
+# Every value here can be overridden on the CLI:
+#   python train.py --epochs 100 --lr0 0.005 --model_size m
+# Or by pointing to a custom YAML:
+#   python train.py --cfg configs/my_experiment.yaml
+
+model:
+  model_size:      "s"      # n / s / m / l / x
+  num_classes:     80
+  angle_step:      15       # degrees per polygon bin  (num_angles = 360//angle_step)
+  num_dist_blocks: 1        # ConvBN layers in distance head before final 1x1
+  min_distance:    0.5      # metres – clip lower bound for log-distance
+  max_distance:    200.0    # metres – clip upper bound for log-distance
+
+data:
+  poly_dataset_root: "data/polygon"           # must contain images/ and labels/
+  dist_dataset_root: "data/polygon_distance"  # must contain images/ and labels/
+  img_size:    640
+  max_labels:  100
+  # augmentation
+  mosaic_prob:  1.0
+  hsv_h:        0.015
+  hsv_s:        0.7
+  hsv_v:        0.4
+  flip_lr_prob: 0.5
+  # loader
+  batch_size:  16
+  num_workers: 4
+
+train:
+  epochs:        300
+  warmup_epochs: 3
+  lr0:           0.01
+  lrf:           0.01    # final LR = lr0 * lrf  (cosine decay target)
+  momentum:      0.937
+  weight_decay:  0.0005
+  # loss gains
+  box_gain:        7.5
+  cls_gain:        0.5
+  dfl_gain:        1.5
+  poly_gain:       0.1
+  dist_gain:       0.1
+  poly_dist_gain:  2.0
+  poly_conf_gain:  0.2
+  poly_angle_gain: 0.5
+  # misc
+  device:       "cpu"
+  save_dir:     "runs/train"
+  val_interval: 5        # run validation every N epochs
+  conf_thres:   0.5
+  iou_thres:    0.45
+  # logging / visualisation
+  log_interval:      10   # log training loss every N steps
+  vis_interval:      1    # save visualisation every N epochs
+  vis_max_images:    8    # max images per visualisation grid
+  tensorboard:       true
