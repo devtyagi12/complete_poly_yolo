@@ -26,6 +26,24 @@ import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Normalisation factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+# GroupNorm group count — 32 is standard; falls back to out_ch if out_ch < 32.
+_GN_GROUPS = 32
+
+def _make_norm(out_ch: int, use_gn: bool) -> nn.Module:
+    """Return GroupNorm (AMD) or BatchNorm2d (NVIDIA) for out_ch channels."""
+    if use_gn:
+        groups = min(_GN_GROUPS, out_ch)
+        # out_ch must be divisible by groups; reduce groups until it is
+        while out_ch % groups != 0 and groups > 1:
+            groups -= 1
+        return nn.GroupNorm(groups, out_ch, eps=1e-3)
+    return nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Basic building blocks
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -38,10 +56,11 @@ class ConvBN(nn.Module):
         s: int = 1,
         p: int = 0,
         act: bool = True,
+        use_gn: bool = False,
     ):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
-        self.bn   = nn.BatchNorm2d(out_ch, eps=1e-3, momentum=0.03)
+        self.bn   = _make_norm(out_ch, use_gn)
         self.act  = nn.SiLU(inplace=True) if act else nn.Identity()
 
     def forward(self, x):
@@ -49,11 +68,12 @@ class ConvBN(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    def __init__(self, ch: int, shortcut: bool = True, e: float = 0.5):
+    def __init__(self, ch: int, shortcut: bool = True, e: float = 0.5,
+                 use_gn: bool = False):
         super().__init__()
         hid = int(ch * e)
-        self.cv1 = ConvBN(ch, hid, 3, 1, 1)
-        self.cv2 = ConvBN(hid, ch, 3, 1, 1)
+        self.cv1 = ConvBN(ch, hid, 3, 1, 1, use_gn=use_gn)
+        self.cv2 = ConvBN(hid, ch, 3, 1, 1, use_gn=use_gn)
         self.add = shortcut
 
     def forward(self, x):
@@ -62,13 +82,14 @@ class Bottleneck(nn.Module):
 
 class C2f(nn.Module):
     """CSP-style fused bottleneck (YOLOv8 C2f)."""
-    def __init__(self, in_ch: int, out_ch: int, n: int = 1, shortcut: bool = True):
+    def __init__(self, in_ch: int, out_ch: int, n: int = 1, shortcut: bool = True,
+                 use_gn: bool = False):
         super().__init__()
         self.hid  = out_ch // 2
-        self.cv1  = ConvBN(in_ch, out_ch, 1)
-        self.cv2  = ConvBN((2 + n) * self.hid, out_ch, 1)
+        self.cv1  = ConvBN(in_ch, out_ch, 1, use_gn=use_gn)
+        self.cv2  = ConvBN((2 + n) * self.hid, out_ch, 1, use_gn=use_gn)
         self.bots = nn.ModuleList(
-            [Bottleneck(self.hid, shortcut) for _ in range(n)]
+            [Bottleneck(self.hid, shortcut, use_gn=use_gn) for _ in range(n)]
         )
 
     def forward(self, x):
@@ -78,11 +99,11 @@ class C2f(nn.Module):
 
 
 class SPPF(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int = 5):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 5, use_gn: bool = False):
         super().__init__()
         hid      = in_ch // 2
-        self.cv1 = ConvBN(in_ch, hid, 1)
-        self.cv2 = ConvBN(hid * 4, out_ch, 1)
+        self.cv1 = ConvBN(in_ch, hid, 1, use_gn=use_gn)
+        self.cv2 = ConvBN(hid * 4, out_ch, 1, use_gn=use_gn)
         self.mp  = nn.MaxPool2d(k, 1, k // 2)
 
     def forward(self, x):
@@ -101,7 +122,8 @@ class YOLOv8Backbone(nn.Module):
     Produces three FPN feature maps: P3 (stride 8), P4 (16), P5 (32).
     Channels: [128, 256, 512] for size 's'.
     """
-    def __init__(self, depth: int = 1, width_mult: float = 0.5):
+    def __init__(self, depth: int = 1, width_mult: float = 0.5,
+                 use_gn: bool = False):
         super().__init__()
         def ch(c):
             return max(round(c * width_mult), 1)
@@ -111,25 +133,25 @@ class YOLOv8Backbone(nn.Module):
 
         # stem
         self.stem = nn.Sequential(
-            ConvBN(3, ch(64), 3, 2, 1),
-            ConvBN(ch(64), ch(128), 3, 2, 1),
-            C2f(ch(128), ch(128), reps(3), True),
+            ConvBN(3, ch(64), 3, 2, 1, use_gn=use_gn),
+            ConvBN(ch(64), ch(128), 3, 2, 1, use_gn=use_gn),
+            C2f(ch(128), ch(128), reps(3), True, use_gn=use_gn),
         )
         # P3
         self.stage1 = nn.Sequential(
-            ConvBN(ch(128), ch(256), 3, 2, 1),
-            C2f(ch(256), ch(256), reps(6), True),
+            ConvBN(ch(128), ch(256), 3, 2, 1, use_gn=use_gn),
+            C2f(ch(256), ch(256), reps(6), True, use_gn=use_gn),
         )
         # P4
         self.stage2 = nn.Sequential(
-            ConvBN(ch(256), ch(512), 3, 2, 1),
-            C2f(ch(512), ch(512), reps(6), True),
+            ConvBN(ch(256), ch(512), 3, 2, 1, use_gn=use_gn),
+            C2f(ch(512), ch(512), reps(6), True, use_gn=use_gn),
         )
         # P5
         self.stage3 = nn.Sequential(
-            ConvBN(ch(512), ch(512), 3, 2, 1),
-            C2f(ch(512), ch(512), reps(3), True),
-            SPPF(ch(512), ch(512)),
+            ConvBN(ch(512), ch(512), 3, 2, 1, use_gn=use_gn),
+            C2f(ch(512), ch(512), reps(3), True, use_gn=use_gn),
+            SPPF(ch(512), ch(512), use_gn=use_gn),
         )
 
         self.out_channels = [ch(256), ch(512), ch(512)]
@@ -147,7 +169,8 @@ class YOLOv8Backbone(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class YOLOv8Neck(nn.Module):
-    def __init__(self, in_channels: List[int], depth: int = 1):
+    def __init__(self, in_channels: List[int], depth: int = 1,
+                 use_gn: bool = False):
         super().__init__()
         c3, c4, c5 = in_channels
 
@@ -156,17 +179,17 @@ class YOLOv8Neck(nn.Module):
 
         # top-down
         self.up5      = nn.Upsample(scale_factor=2)
-        self.c2f_p4   = C2f(c4 + c5, c4, reps(3))
+        self.c2f_p4   = C2f(c4 + c5, c4, reps(3), use_gn=use_gn)
 
         self.up4      = nn.Upsample(scale_factor=2)
-        self.c2f_p3   = C2f(c3 + c4, c3, reps(3))
+        self.c2f_p3   = C2f(c3 + c4, c3, reps(3), use_gn=use_gn)
 
         # bottom-up
-        self.down_p3  = ConvBN(c3, c3, 3, 2, 1)
-        self.c2f_n4   = C2f(c3 + c4, c4, reps(3))
+        self.down_p3  = ConvBN(c3, c3, 3, 2, 1, use_gn=use_gn)
+        self.c2f_n4   = C2f(c3 + c4, c4, reps(3), use_gn=use_gn)
 
-        self.down_n4  = ConvBN(c4, c4, 3, 2, 1)
-        self.c2f_n5   = C2f(c4 + c5, c5, reps(3))
+        self.down_n4  = ConvBN(c4, c4, 3, 2, 1, use_gn=use_gn)
+        self.c2f_n5   = C2f(c4 + c5, c5, reps(3), use_gn=use_gn)
 
         self.out_channels = [c3, c4, c5]
 
@@ -194,22 +217,22 @@ class DetHead(nn.Module):
     """
     REG_MAX = 16   # DFL bins
 
-    def __init__(self, in_ch: int, num_classes: int):
+    def __init__(self, in_ch: int, num_classes: int, use_gn: bool = False):
         super().__init__()
         self.nc = num_classes
         mid     = max(in_ch, 256)
 
         # ── box branch ────────────────────────────────────────────────────────
         self.box_pre = nn.Sequential(
-            ConvBN(in_ch, mid, 3, 1, 1),
-            ConvBN(mid,   mid, 3, 1, 1),
+            ConvBN(in_ch, mid, 3, 1, 1, use_gn=use_gn),
+            ConvBN(mid,   mid, 3, 1, 1, use_gn=use_gn),
         )
         self.box_out = nn.Conv2d(mid, 4 * self.REG_MAX, 1)
 
         # ── class branch ─────────────────────────────────────────────────────
         self.cls_pre = nn.Sequential(
-            ConvBN(in_ch, mid, 3, 1, 1),
-            ConvBN(mid,   mid, 3, 1, 1),
+            ConvBN(in_ch, mid, 3, 1, 1, use_gn=use_gn),
+            ConvBN(mid,   mid, 3, 1, 1, use_gn=use_gn),
         )
         self.cls_out = nn.Conv2d(mid, num_classes, 1)
 
@@ -249,15 +272,16 @@ class PolyHead(nn.Module):
 
 class DistHead(nn.Module):
     """num_dist_blocks × ConvBN(3×3) + Conv1×1 → scalar per anchor."""
-    def __init__(self, in_ch: int, num_dist_blocks: int = 1):
+    def __init__(self, in_ch: int, num_dist_blocks: int = 1,
+                 use_gn: bool = False):
         super().__init__()
         mid = max(in_ch // 2, 64)
         layers: list[nn.Module] = []
         ch_in = in_ch
         for _ in range(num_dist_blocks):
-            layers += [ConvBN(ch_in, mid, 3, 1, 1)]
+            layers += [ConvBN(ch_in, mid, 3, 1, 1, use_gn=use_gn)]
             ch_in = mid
-        layers += [ConvBN(ch_in, 1, 1, act=False)]
+        layers += [ConvBN(ch_in, 1, 1, act=False, use_gn=use_gn)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -291,41 +315,177 @@ class YOLOv8Extended(nn.Module):
         num_angles: int = 24,
         num_dist_blocks: int = 1,
         strides: List[int] | None = None,
+        gpu_type: str = "nvidia",   # "nvidia" → BN, "amd" → GN
     ):
         super().__init__()
-        self.num_classes    = num_classes
-        self.num_angles     = num_angles
+        self.num_classes     = num_classes
+        self.num_angles      = num_angles
         self.num_dist_blocks = num_dist_blocks
-        self.strides        = strides or [8, 16, 32]
+        self.strides         = strides or [8, 16, 32]
+
+        use_gn = (gpu_type.lower() == "amd")
 
         d = DEPTH_MULT[model_size]
         w = WIDTH_MULT[model_size]
 
-        self.backbone = YOLOv8Backbone(depth=d, width_mult=w)
-        self.neck     = YOLOv8Neck(self.backbone.out_channels, depth=d)
+        self.backbone = YOLOv8Backbone(depth=d, width_mult=w, use_gn=use_gn)
+        self.neck     = YOLOv8Neck(self.backbone.out_channels, depth=d,
+                                   use_gn=use_gn)
 
         neck_chs = self.neck.out_channels   # [c3, c4, c5]
 
         self.det_heads  = nn.ModuleList([
-            DetHead(c, num_classes) for c in neck_chs
+            DetHead(c, num_classes, use_gn=use_gn) for c in neck_chs
         ])
         self.poly_heads = nn.ModuleList([
             PolyHead(max(c, 256), num_angles) for c in neck_chs
         ])
         self.dist_heads = nn.ModuleList([
-            DistHead(c, num_dist_blocks) for c in neck_chs
+            DistHead(c, num_dist_blocks, use_gn=use_gn) for c in neck_chs
         ])
 
-        self._init_weights()
+        self._init_weights(use_gn)
+
+    # ── pretrained weights ────────────────────────────────────────────────────
+
+    def load_pretrained_backbone(self, model_size: str) -> dict:
+        """
+        Download official ultralytics YOLOv8 weights and copy backbone + neck
+        parameters into this model by matching parameter names and shapes.
+
+        Strategy
+        ────────
+        Ultralytics uses numeric layer indices: model.0.*, model.1.*, …
+        We map those indices to our named submodules using the known YOLOv8
+        architecture layout, then match parameter suffixes exactly.
+
+        Only backbone.* and neck.* parameters are transferred.
+        All head weights (det, poly, dist) stay randomly initialised.
+
+        Returns a summary dict: matched / skipped_shape / skipped_name / total_dst.
+        """
+        import re
+
+        # ── official YOLOv8 layer-index → our submodule prefix ────────────────
+        # YOLOv8s backbone: layers 0-9, neck: 10-22 (approximate; shape-match
+        # handles slight version differences automatically).
+        LAYER_TO_MODULE = {
+            # backbone
+            0:  "backbone.stem.0",      # Conv  (stem[0])
+            1:  "backbone.stem.1",      # Conv  (stem[1])
+            2:  "backbone.stem.2",      # C2f   (stem[2])
+            3:  "backbone.stage1.0",    # Conv
+            4:  "backbone.stage1.1",    # C2f
+            5:  "backbone.stage2.0",    # Conv
+            6:  "backbone.stage2.1",    # C2f
+            7:  "backbone.stage3.0",    # Conv
+            8:  "backbone.stage3.1",    # C2f
+            9:  "backbone.stage3.2",    # SPPF
+            # neck (PAN-FPN)
+            10: "neck.up5",             # Upsample (no params)
+            11: "neck.c2f_p4",          # C2f
+            12: "neck.up4",             # Upsample (no params)
+            13: "neck.c2f_p3",          # C2f
+            14: "neck.down_p3",         # Conv
+            15: "neck.c2f_n4",          # C2f
+            16: "neck.down_n4",         # Conv
+            17: "neck.c2f_n5",          # C2f
+        }
+
+        # ── download weights ──────────────────────────────────────────────────
+        hub_names = {
+            "n": "yolov8n.pt", "s": "yolov8s.pt",
+            "m": "yolov8m.pt", "l": "yolov8l.pt", "x": "yolov8x.pt",
+        }
+        pt_name = hub_names[model_size]
+
+        src_sd = None
+
+        # Method 1: ultralytics package (preferred — handles download + caching)
+        try:
+            from ultralytics import YOLO as _YOLO
+            _ult  = _YOLO(pt_name)
+            src_sd = _ult.model.state_dict()
+        except Exception:
+            pass
+
+        # Method 2: torch.hub
+        if src_sd is None:
+            try:
+                _hub = torch.hub.load(
+                    "ultralytics/ultralytics",
+                    "yolov8" + model_size,
+                    pretrained=True, verbose=False,
+                )
+                src_sd = _hub.model.state_dict()
+            except Exception:
+                pass
+
+        if src_sd is None:
+            raise RuntimeError(
+                "Could not download pretrained YOLOv8 weights.\n"
+                "  • Install ultralytics:  pip install ultralytics\n"
+                "  • Or pass --no_pretrained to train from scratch."
+            )
+
+        # ── build source lookup: our_submodule_prefix.param_suffix → tensor ───
+        # e.g. "backbone.stem.0.conv.weight" → tensor
+        _idx_re = re.compile(r"^model\.(\d+)\.(.*)")
+        src_lookup: dict[str, torch.Tensor] = {}
+
+        for k, v in src_sd.items():
+            m = _idx_re.match(k)
+            if not m:
+                continue
+            layer_idx  = int(m.group(1))
+            param_suf  = m.group(2)          # e.g. "cv1.conv.weight"
+            our_prefix = LAYER_TO_MODULE.get(layer_idx)
+            if our_prefix is None:
+                continue
+            our_key = f"{our_prefix}.{param_suf}"
+            src_lookup[our_key] = v
+
+        # ── transfer matching parameters ──────────────────────────────────────
+        dst_sd        = self.state_dict()
+        update_sd:    dict[str, torch.Tensor] = {}
+        matched       = 0
+        skipped_shape = 0
+        skipped_name  = 0
+
+        for dst_key, dst_val in dst_sd.items():
+            if not (dst_key.startswith("backbone.") or
+                    dst_key.startswith("neck.")):
+                skipped_name += 1
+                continue
+
+            if dst_key in src_lookup:
+                src_val = src_lookup[dst_key]
+                if src_val.shape == dst_val.shape:
+                    update_sd[dst_key] = src_val
+                    matched += 1
+                else:
+                    skipped_shape += 1
+            else:
+                skipped_name += 1
+
+        self.load_state_dict(update_sd, strict=False)
+
+        return {
+            "matched":       matched,
+            "skipped_shape": skipped_shape,
+            "skipped_name":  skipped_name,
+            "total_dst":     len(dst_sd),
+        }
 
     # ── weight init ───────────────────────────────────────────────────────────
-    def _init_weights(self):
+    def _init_weights(self, use_gn: bool = False):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                        nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
