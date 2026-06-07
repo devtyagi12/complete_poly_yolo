@@ -21,6 +21,7 @@ import argparse
 import math
 import os
 from dataclasses import dataclass, field, fields
+from typing import List
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,12 @@ class ModelConfig:
     num_dist_blocks: int   = 1
     min_distance:    float = 0.5
     max_distance:    float = 200.0
+    # "nvidia" → BatchNorm2d (default)
+    # "amd"    → GroupNorm   (avoids MIOpen BN JIT issues on ROCm/Windows)
+    gpu_type:        str   = "nvidia"
+    # Load official ultralytics backbone+neck weights as starting point.
+    # New heads (polygon, distance) are always initialised from scratch.
+    pretrained:      bool  = True
 
     # derived — always recomputed from angle_step
     @property
@@ -52,33 +59,59 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    poly_dataset_root: str   = "data/polygon"
-    dist_dataset_root: str   = "data/polygon_distance"
-    img_size:          int   = 640
-    max_labels:        int   = 100
-    mosaic_prob:       float = 1.0
-    hsv_h:             float = 0.015
-    hsv_s:             float = 0.7
-    hsv_v:             float = 0.4
-    flip_lr_prob:      float = 0.5
-    batch_size:        int   = 16
-    num_workers:       int   = 4
+    # ── polygon datasets (required) ───────────────────────────────────────────
+    # Primary dataset root (used when poly_datasets list is empty)
+    poly_dataset_root: str        = "data/polygon"
+    # Multi-dataset support: list of "img_dir:lbl_dir" strings.
+    # If non-empty, overrides poly_dataset_root.
+    poly_datasets:     field = field(default_factory=list)
+    # Per-dataset sampling weights (parallel to poly_datasets).
+    # Empty = uniform sampling.
+    poly_weights:      field = field(default_factory=list)
 
-    # ── derived ───────────────────────────────────────────────────────────────
-    @property
-    def angle_step(self) -> int:
-        # kept in sync with model; access via cfg.model.angle_step
-        return 15
+    # ── distance dataset (optional) ───────────────────────────────────────────
+    # Set to empty string "" or omit to disable.
+    dist_dataset_root: str   = ""
 
-    @property
-    def min_distance(self) -> float:
-        return 0.5
+    # ── image ─────────────────────────────────────────────────────────────────
+    img_size:     int   = 640
+    max_labels:   int   = 100
 
-    @property
-    def max_distance(self) -> float:
-        return 200.0
+    # ── augmentation ─────────────────────────────────────────────────────────
+    mosaic_prob:  float = 1.0
+    hsv_h:        float = 0.015
+    hsv_s:        float = 0.7
+    hsv_v:        float = 0.4
+    flip_lr_prob: float = 0.5
+
+    # ── loader ────────────────────────────────────────────────────────────────
+    batch_size:   int   = 16
+    num_workers:  int   = 4
+
+    # ── class names (optional, for visualisation) ─────────────────────────────
+    class_names:  field = field(default_factory=list)
 
     invalid_distance: float = -10.0
+
+    def resolved_poly_datasets(self) -> list:
+        """Return list of (img_dir, lbl_dir) tuples."""
+        if self.poly_datasets:
+            result = []
+            for entry in self.poly_datasets:
+                if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                    result.append(tuple(entry))
+                elif isinstance(entry, str) and ":" in entry:
+                    parts = entry.split(":", 1)
+                    result.append((parts[0], parts[1]))
+            return result
+        # fall back to single root
+        return [(
+            os.path.join(self.poly_dataset_root, "images/{split}"),
+            os.path.join(self.poly_dataset_root, "labels/{split}"),
+        )]
+
+    def has_distance_dataset(self) -> bool:
+        return bool(self.dist_dataset_root)
 
 
 @dataclass
@@ -186,11 +219,28 @@ def _build_parser(description: str = "YOLOv8-Extended") -> argparse.ArgumentPars
     g.add_argument("--num_dist_blocks", default=None, type=int)
     g.add_argument("--min_distance",    default=None, type=float, metavar="METRES")
     g.add_argument("--max_distance",    default=None, type=float, metavar="METRES")
+    g.add_argument("--gpu_type",        default=None, choices=["nvidia", "amd"],
+                   help="'nvidia' uses BatchNorm2d; 'amd' uses GroupNorm "
+                        "(avoids MIOpen JIT failures on ROCm/Windows)")
+    g.add_argument("--no_pretrained",   action="store_true",
+                   help="Skip loading official YOLOv8 backbone/neck weights "
+                        "and train entirely from scratch")
 
     # ── data ──────────────────────────────────────────────────────────────────
     g = ap.add_argument_group("Data")
-    g.add_argument("--poly_dataset_root", default=None)
-    g.add_argument("--dist_dataset_root", default=None)
+    g.add_argument("--poly_dataset_root", default=None,
+                   help="Single polygon dataset root (images/ and labels/ subdirs)")
+    g.add_argument("--poly_datasets", nargs="+", default=None,
+                   metavar="IMG_DIR:LBL_DIR",
+                   help="Multiple polygon datasets as img_dir:lbl_dir pairs")
+    g.add_argument("--poly_weights", nargs="+", type=float, default=None,
+                   metavar="W",
+                   help="Per-dataset sampling weights (parallel to --poly_datasets)")
+    g.add_argument("--dist_dataset_root", default=None,
+                   help="Distance dataset root (optional; omit to disable)")
+    g.add_argument("--class_names", nargs="+", default=None,
+                   metavar="NAME",
+                   help="Class name strings for visualisation")
     g.add_argument("--img_size",    default=None, type=int)
     g.add_argument("--batch_size",  default=None, type=int)
     g.add_argument("--num_workers", default=None, type=int)
@@ -249,9 +299,19 @@ def _apply_args(cfg: Config, args: argparse.Namespace):
     _maybe(cfg.model, "num_dist_blocks", args.num_dist_blocks)
     _maybe(cfg.model, "min_distance",    args.min_distance)
     _maybe(cfg.model, "max_distance",    args.max_distance)
+    _maybe(cfg.model, "gpu_type",        args.gpu_type)
+    if args.no_pretrained:
+        cfg.model.pretrained = False
     # data
     _maybe(cfg.data, "poly_dataset_root", args.poly_dataset_root)
-    _maybe(cfg.data, "dist_dataset_root", args.dist_dataset_root)
+    if args.poly_datasets:
+        cfg.data.poly_datasets = args.poly_datasets
+    if args.poly_weights:
+        cfg.data.poly_weights  = args.poly_weights
+    if args.dist_dataset_root is not None:
+        cfg.data.dist_dataset_root = args.dist_dataset_root
+    if args.class_names:
+        cfg.data.class_names = args.class_names
     _maybe(cfg.data, "img_size",          args.img_size)
     _maybe(cfg.data, "batch_size",        args.batch_size)
     _maybe(cfg.data, "num_workers",       args.num_workers)
