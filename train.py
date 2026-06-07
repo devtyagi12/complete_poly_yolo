@@ -3,21 +3,25 @@ Training script for YOLOv8-Extended.
 
 Usage examples
 ──────────────
-  # defaults from configs/default.yaml
-  python train.py
+  # single polygon dataset
+  python train.py --poly_dataset_root data/polygon --num_classes 10
+
+  # multiple polygon datasets with weights + optional distance
+  python train.py \\
+      --poly_datasets data/poly1/images/train:data/poly1/labels/train \\
+                      data/poly2/images/train:data/poly2/labels/train \\
+      --poly_weights 2.0 1.0 \\
+      --dist_dataset_root data/polygon_distance \\
+      --num_classes 10
 
   # custom YAML + CLI override
   python train.py --cfg configs/my_exp.yaml --epochs 100 --batch_size 8
 
-  # full CLI (no YAML needed)
-  python train.py \\
-      --model_size m --num_classes 10 \\
-      --poly_dataset_root data/poly --dist_dataset_root data/dist \\
-      --epochs 200 --lr0 0.005 --batch_size 16 \\
-      --save_dir runs/exp1 --vis_interval 5 --no_tensorboard
-
   # resume
-  python train.py --resume runs/exp1/last.pt
+  python train.py --resume runs/train/exp1/last.pt
+
+  # AMD GPU (GroupNorm + no AMP)
+  python train.py --gpu_type amd --no_amp
 """
 from __future__ import annotations
 
@@ -26,11 +30,11 @@ import math
 import os
 import time
 from pathlib import Path
-from tqdm import tqdm
+from typing import List, Optional, Tuple
 
 import torch
 import torch.optim as optim
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 
 from configs.config import Config, load_config, save_config
 from data.dataset import build_dataloader
@@ -42,7 +46,27 @@ from utils.metrics import BBoxF1Metric
 from utils.visualiser import Visualiser
 
 
-torch.backends.cudnn.enabled = False
+# ─────────────────────────────────────────────────────────────────────────────
+# Save-dir: auto-increment to avoid overwriting previous runs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_save_dir(base: str, resume_path: Optional[str]) -> Path:
+    """
+    If resume_path is given return the directory that checkpoint lives in.
+    Otherwise, find the next available numbered sub-directory:
+        runs/train → runs/train/exp1  (if exp1 exists → exp2, exp3, …)
+    """
+    if resume_path:
+        return Path(resume_path).parent
+
+    base_path = Path(base)
+    for i in range(1, 10_000):
+        candidate = base_path / f"exp{i}"
+        if not candidate.exists():
+            candidate.mkdir(parents=True)
+            return candidate
+    raise RuntimeError(f"Could not find a free experiment directory under {base}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LR schedule
@@ -52,7 +76,7 @@ def _cosine_lr(optimizer, epoch, total_epochs, warmup_epochs, lr0, lrf):
     if epoch < warmup_epochs:
         lr = lr0 * (epoch + 1) / max(warmup_epochs, 1)
     else:
-        t = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+        t  = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
         lr = lrf + 0.5 * (lr0 - lrf) * (1 + math.cos(math.pi * t))
     for pg in optimizer.param_groups:
         pg["lr"] = lr
@@ -106,6 +130,66 @@ def _load_ckpt(path, model, optimizer, scaler, device, logger):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Dataset builder helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_loader(dc, mc, split: str, augment: bool) -> "DataLoader":
+    """
+    Build a DataLoader for one split using the DataConfig.
+    Supports single dataset root, multi-dataset list, and optional distance.
+    """
+    # ── resolve polygon datasets ──────────────────────────────────────────────
+    if dc.poly_datasets:
+        # explicit list of img:lbl pairs (already resolved by config)
+        poly_ds = []
+        for entry in dc.poly_datasets:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                img_d, lbl_d = entry
+            elif isinstance(entry, str) and ":" in entry:
+                img_d, lbl_d = entry.split(":", 1)
+            else:
+                continue
+            # allow {split} placeholder
+            poly_ds.append((
+                img_d.replace("{split}", split),
+                lbl_d.replace("{split}", split),
+            ))
+        weights = list(dc.poly_weights) if dc.poly_weights else None
+    else:
+        # single root
+        poly_ds = [(
+            os.path.join(dc.poly_dataset_root, f"images/{split}"),
+            os.path.join(dc.poly_dataset_root, f"labels/{split}"),
+        )]
+        weights = None
+
+    # ── resolve distance dataset ──────────────────────────────────────────────
+    dist_img = dist_lbl = None
+    if dc.dist_dataset_root:
+        dist_img = os.path.join(dc.dist_dataset_root, f"images/{split}")
+        dist_lbl = os.path.join(dc.dist_dataset_root, f"labels/{split}")
+
+    return build_dataloader(
+        poly_datasets = poly_ds,
+        poly_weights  = weights,
+        dist_img_dir  = dist_img,
+        dist_lbl_dir  = dist_lbl,
+        img_size      = dc.img_size,
+        batch_size    = dc.batch_size,
+        num_workers   = dc.num_workers,
+        angle_step    = mc.angle_step,
+        min_dist      = mc.min_distance,
+        max_dist      = mc.max_distance,
+        augment       = augment,
+        hsv_h         = dc.hsv_h,
+        hsv_s         = dc.hsv_s,
+        hsv_v         = dc.hsv_v,
+        flip_lr_prob  = dc.flip_lr_prob,
+        mosaic_prob   = dc.mosaic_prob,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Validation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -119,7 +203,8 @@ def validate(
     logger: Logger,
     vis: Visualiser,
     epoch: int,
-) -> float:
+    n_epochs: int = 0,
+) -> Tuple[float, float, float, dict]:
     model.eval()
     mc = cfg.model
     dc = cfg.data
@@ -127,30 +212,34 @@ def validate(
 
     metric = BBoxF1Metric(num_classes=mc.num_classes, iou_thres=0.5)
 
-    # collect one batch for visualisation
-    vis_imgs    = None
-    vis_targets = None
-    vis_dets    = None
+    vis_imgs_list:    List[torch.Tensor] = []
+    vis_targets_list: List[torch.Tensor] = []
+    vis_dets_list:    list               = []
+    vis_collected = 0
 
-    for batch_idx, (imgs, targets) in tqdm(enumerate(val_loader), total=len(val_loader)):
+    for imgs, targets in val_loader:
         imgs    = imgs.to(device)
         targets = targets.to(device)
         B       = imgs.shape[0]
 
-        preds      = model(imgs)
+        preds       = model(imgs)
         orig_shapes = [(dc.img_size, dc.img_size)] * B
         detections  = post_proc(preds, orig_shapes)
 
-        if vis_imgs is None:
-            vis_imgs    = imgs.cpu()
-            vis_targets = targets.cpu()
-            vis_dets    = detections
+        # collect images for visualisation
+        if vis_collected < tc.vis_max_images:
+            take = min(B, tc.vis_max_images - vis_collected)
+            bt   = targets[targets[:, 0] < take].cpu().clone()
+            bt[:, 0] += vis_collected          # rebase batch-idx for concat
+            vis_imgs_list.append(imgs[:take].cpu())
+            vis_targets_list.append(bt)
+            vis_dets_list.extend(detections[:take])
+            vis_collected += take
 
         for bi in range(B):
             mask = targets[:, 0] == bi
-            bt   = targets[mask]
             gts  = []
-            for row in bt:
+            for row in targets[mask]:
                 cls = int(row[1].item())
                 cx  = row[2].item() * dc.img_size
                 cy  = row[3].item() * dc.img_size
@@ -159,13 +248,11 @@ def validate(
                 gts.append((cls, cx - w_/2, cy - h_/2, cx + w_/2, cy + h_/2))
             metric.update(detections[bi], gts)
 
-    result   = metric.compute()
-    micro    = result["micro"]
-    per_cls  = {k: v for k, v in result.items() if k != "micro"}
-    is_best  = False   # caller sets this
+    result = metric.compute()
+    micro  = result["micro"]
 
     logger.log_val(
-        epoch=epoch,
+        epoch=epoch, n_epochs=n_epochs,
         precision=micro["precision"],
         recall=micro["recall"],
         f1=micro["f1"],
@@ -173,16 +260,17 @@ def validate(
         is_best=False,
     )
 
-    # vis panel 2: GT vs pred
-    if vis_imgs is not None:
-        vis.save_val_predictions(epoch, vis_imgs, vis_targets, vis_dets)
+    if vis_imgs_list:
+        all_imgs    = torch.cat(vis_imgs_list,    dim=0)
+        all_targets = torch.cat(vis_targets_list, dim=0)
+        vis.save_val_predictions(epoch, all_imgs, all_targets, vis_dets_list)
 
     model.train()
-    return micro["f1"], result
+    return micro["f1"], micro["precision"], micro["recall"], result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Main training function
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(cfg: Config | None = None):
@@ -206,22 +294,29 @@ def train(cfg: Config | None = None):
     dc = cfg.data
     tc = cfg.train
 
-    device   = torch.device(tc.device if torch.cuda.is_available() else "cpu")
-    save_dir = Path(tc.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    # ── resolve experiment directory (auto-increment) ─────────────────────────
+    save_dir = _resolve_save_dir(tc.save_dir, resume_path)
+    # write back so logger and checkpoints use the resolved path
+    tc.save_dir = str(save_dir)
+
+    device = torch.device(tc.device if torch.cuda.is_available() else "cpu")
 
     # ── logger ────────────────────────────────────────────────────────────────
     logger = Logger(save_dir=save_dir, use_tb=tc.tensorboard)
     logger.log_config(cfg)
-    logger.info(f"Device: {device}  |  save_dir: {save_dir}")
+    logger.info(f"Experiment → {save_dir}")
+    logger.info(f"Device     → {device}")
 
     # ── visualiser ────────────────────────────────────────────────────────────
+    class_names = dc.class_names if dc.class_names else None
     vis = Visualiser(
         save_dir       = save_dir,
         num_angles     = mc.num_angles,
+        angle_step     = mc.angle_step,
         img_size       = dc.img_size,
         vis_max_images = tc.vis_max_images,
         conf_thresh    = tc.conf_thres,
+        class_names    = class_names,
         logger         = logger,
     )
 
@@ -232,10 +327,34 @@ def train(cfg: Config | None = None):
         num_angles      = mc.num_angles,
         num_dist_blocks = mc.num_dist_blocks,
         strides         = mc.strides,
+        gpu_type        = mc.gpu_type,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    logger.info(f"Model: YOLOv8{mc.model_size}  |  {n_params:.1f}M parameters")
+    logger.info(f"Model      → YOLOv8{mc.model_size}  |  {n_params:.1f}M parameters")
+
+    # ── pretrained backbone/neck weights ──────────────────────────────────────
+    if mc.pretrained and resume_path is None:
+        logger.info("Loading pretrained YOLOv8 backbone + neck weights …")
+        try:
+            stats = model.load_pretrained_backbone(mc.model_size)
+            logger.info(
+                f"  Pretrained weights loaded  "
+                f"matched={stats['matched']}  "
+                f"skipped_shape={stats['skipped_shape']}  "
+                f"skipped_name={stats['skipped_name']}  "
+                f"total_dst={stats['total_dst']}"
+            )
+            if stats["matched"] == 0:
+                logger.warning(
+                    "No weights were matched. The backbone/neck may have "
+                    "incompatible channel widths.  Training from scratch."
+                )
+        except Exception as e:
+            logger.warning(
+                f"Could not load pretrained weights ({e}). "
+                f"Training from scratch.  Pass --no_pretrained to suppress."
+            )
 
     # ── loss ──────────────────────────────────────────────────────────────────
     criterion = YOLOv8ExtendedLoss(
@@ -266,36 +385,21 @@ def train(cfg: Config | None = None):
     optimizer = optim.SGD(
         param_groups, lr=tc.lr0, momentum=tc.momentum, nesterov=True
     )
-    scaler = GradScaler(tc.device, enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
 
     # ── EMA ───────────────────────────────────────────────────────────────────
     ema = ModelEMA(model)
 
     # ── data ──────────────────────────────────────────────────────────────────
-    def _loader(split: str, augment: bool):
-        return build_dataloader(
-            poly_img_dir = os.path.join(dc.poly_dataset_root, f"images/{split}"),
-            poly_lbl_dir = os.path.join(dc.poly_dataset_root, f"labels/{split}"),
-            dist_img_dir = os.path.join(dc.dist_dataset_root, f"images/{split}"),
-            dist_lbl_dir = os.path.join(dc.dist_dataset_root, f"labels/{split}"),
-            img_size     = dc.img_size,
-            batch_size   = dc.batch_size,
-            num_workers  = dc.num_workers,
-            angle_step   = mc.angle_step,
-            min_dist     = mc.min_distance,
-            max_dist     = mc.max_distance,
-            augment      = augment,
-            hsv_h        = dc.hsv_h,
-            hsv_s        = dc.hsv_s,
-            hsv_v        = dc.hsv_v,
-            flip_lr_prob = dc.flip_lr_prob,
-            mosaic_prob  = dc.mosaic_prob,
-        )
+    train_loader = _build_loader(dc, mc, "train", augment=True)
+    val_loader   = _build_loader(dc, mc, "val",   augment=False)
 
-    train_loader = _loader("train", augment=True)
-    val_loader   = _loader("val",   augment=False)
-    logger.info(f"Train batches: {len(train_loader)}  |  "
-                f"Val batches: {len(val_loader)}")
+    n_poly_ds = len(dc.poly_datasets) if dc.poly_datasets else 1
+    dist_info = (f"+ dist dataset" if dc.dist_dataset_root else "no dist dataset")
+    logger.info(
+        f"Data       → {n_poly_ds} polygon dataset(s)  {dist_info}  "
+        f"| train={len(train_loader)} batches  val={len(val_loader)} batches"
+    )
 
     # ── post-processor ────────────────────────────────────────────────────────
     post_proc = PostProcessor(
@@ -327,39 +431,43 @@ def train(cfg: Config | None = None):
 
     # ── training loop ─────────────────────────────────────────────────────────
     model.train()
-    n_steps = len(train_loader)
+    n_steps  = len(train_loader)
+    n_epochs = tc.epochs
 
-    for epoch in range(start_epoch, tc.epochs):
+    for epoch in range(start_epoch, n_epochs):
         lr = _cosine_lr(
-            optimizer, epoch, tc.epochs, tc.warmup_epochs, tc.lr0, tc.lrf
+            optimizer, epoch, n_epochs, tc.warmup_epochs, tc.lr0, tc.lrf
         )
 
-        epoch_loss            = 0.0
-        epoch_loss_dict: dict = {}
-        t0                    = time.time()
+        epoch_loss:       float = 0.0
+        epoch_loss_dict:  dict  = {}
+        epoch_instances:  int   = 0
+        t0 = time.time()
 
-        # keep one batch for visualisation
         vis_batch_imgs    = None
         vis_batch_targets = None
 
-        for step, (imgs, targets) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        logger._print_epoch_header(epoch, n_epochs, n_steps, dc.img_size)
+
+        for step, (imgs, targets) in enumerate(train_loader):
             imgs    = imgs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            # store first batch for vis
+            n_instances      = targets.shape[0]
+            epoch_instances += n_instances
+
             if step == 0 and vis_batch_imgs is None:
                 vis_batch_imgs    = imgs.detach().cpu()
                 vis_batch_targets = targets.detach().cpu()
 
-            with autocast(tc.device, enabled=use_amp):
-                preds = model(imgs)
+            with autocast(enabled=use_amp):
+                preds           = model(imgs)
                 loss, loss_dict = criterion(preds, targets)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
 
-            # gradient norm
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=10.0
             ).item()
@@ -374,12 +482,13 @@ def train(cfg: Config | None = None):
 
             global_step = epoch * n_steps + step
 
-            # ── step-level log (every log_interval steps) ─────────────────────
+            logger.log_step(
+                epoch=epoch,   n_epochs=n_epochs,
+                step=step,     n_steps=n_steps,
+                loss=loss.item(), loss_dict=loss_dict, lr=lr,
+                n_instances=n_instances, img_size=dc.img_size,
+            )
             if step % tc.log_interval == 0:
-                logger.log_step(
-                    epoch=epoch, step=step, n_steps=n_steps,
-                    loss=loss.item(), loss_dict=loss_dict, lr=lr,
-                )
                 logger.log_grad_norm(grad_norm, global_step)
 
         # ── epoch summary ─────────────────────────────────────────────────────
@@ -388,47 +497,49 @@ def train(cfg: Config | None = None):
         elapsed  = time.time() - t0
 
         logger.log_epoch(
-            epoch=epoch, loss=avg_loss, loss_dict=avg_dict,
+            epoch=epoch, n_epochs=n_epochs,
+            loss=avg_loss, loss_dict=avg_dict,
             lr=lr, elapsed=elapsed,
+            n_instances=epoch_instances // max(n_steps, 1),
+            img_size=dc.img_size,
         )
 
-        # ── visualisation panel 1: training batch ─────────────────────────────
+        # ── vis: training batch ────────────────────────────────────────────────
         if (epoch % tc.vis_interval == 0) and vis_batch_imgs is not None:
             vis.save_train_batch(epoch, vis_batch_imgs, vis_batch_targets)
 
-        # ── loss history (for curves) ─────────────────────────────────────────
         vis.update_loss_history(epoch, avg_loss, avg_dict)
 
         # ── validation ────────────────────────────────────────────────────────
-        if (epoch + 1) % tc.val_interval == 0 or epoch == tc.epochs - 1:
-            f1, val_result = validate(
-                ema.ema, val_loader, post_proc, cfg, device, logger, vis, epoch
+        if (epoch + 1) % tc.val_interval == 0 or epoch == n_epochs - 1:
+            f1, prec, rec, val_result = validate(
+                ema.ema, val_loader, post_proc, cfg, device,
+                logger, vis, epoch, n_epochs=n_epochs,
             )
 
-            vis.update_loss_history(epoch, avg_loss, avg_dict, val_f1=f1)
+            vis.update_loss_history(
+                epoch, avg_loss, avg_dict,
+                val_f1=f1, val_prec=prec, val_rec=rec,
+            )
 
             is_best = f1 > best_f1
             if is_best:
                 best_f1 = f1
-                logger.log_val(epoch, **{
-                    "precision": val_result["micro"]["precision"],
-                    "recall":    val_result["micro"]["recall"],
-                    "f1":        f1,
-                    "per_class": val_result,
-                    "is_best":   True,
-                })
+                logger.log_val(
+                    epoch=epoch, n_epochs=n_epochs,
+                    precision=prec, recall=rec, f1=f1,
+                    per_class=val_result, is_best=True,
+                )
                 _save_ckpt(str(save_dir / "best.pt"),
                            model, optimizer, scaler, epoch, best_f1, logger)
 
             _save_ckpt(str(save_dir / "last.pt"),
                        model, optimizer, scaler, epoch, best_f1, logger)
 
-        # ── loss curves (every vis_interval epochs) ───────────────────────────
         if epoch % tc.vis_interval == 0:
             vis.save_loss_curves(epoch)
 
-    # ── done ──────────────────────────────────────────────────────────────────
-    logger.info(f"\nBest F1 = {best_f1:.4f}")
+    logger.info(f"\nBest F1 = {best_f1:.4f}  |  saved to {save_dir}")
     logger.close()
 
 
