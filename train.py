@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from configs.config import Config, load_config, save_config
 from data.dataset import build_dataloader
@@ -45,6 +45,8 @@ from utils.logger import Logger
 from utils.metrics import BBoxF1Metric
 from utils.visualiser import Visualiser
 
+
+torch.backends.cudnn.enabled = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Save-dir: auto-increment to avoid overwriting previous runs
@@ -385,7 +387,7 @@ def train(cfg: Config | None = None):
     optimizer = optim.SGD(
         param_groups, lr=tc.lr0, momentum=tc.momentum, nesterov=True
     )
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler(tc.device, enabled=use_amp)
 
     # ── EMA ───────────────────────────────────────────────────────────────────
     ema = ModelEMA(model)
@@ -460,7 +462,7 @@ def train(cfg: Config | None = None):
                 vis_batch_imgs    = imgs.detach().cpu()
                 vis_batch_targets = targets.detach().cpu()
 
-            with autocast(enabled=use_amp):
+            with autocast(tc.device, enabled=use_amp):
                 preds           = model(imgs)
                 loss, loss_dict = criterion(preds, targets)
 
